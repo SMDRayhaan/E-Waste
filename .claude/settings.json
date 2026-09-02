@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "rust-review@trailofbits": true
+  }
+}
