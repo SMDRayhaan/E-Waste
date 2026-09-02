@@ -3,6 +3,11 @@ use std::process::{Command, Output};
 
 const POWERSHELL_PATH: &str = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 
+// Canonical Windows/.NET elevation test: prints "True" only when the current
+// process token is actually elevated, "False" otherwise (non-elevated split
+// token, or a user who is not an administrator at all).
+const ELEVATION_CHECK: &str = "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)";
+
 #[derive(Debug, Deserialize)]
 struct PhysicalDisk {
     #[serde(rename = "Number")]
@@ -270,6 +275,35 @@ fn execute_powershell(command: &str) -> Result<Output, Box<dyn std::error::Error
         .map_err(|e| e.into())
 }
 
+// Only "True"/"False" are accepted; anything else (empty output, a PowerShell
+// warning printed to stdout, unexpected text) is an error so the caller fails
+// closed rather than guessing about elevation.
+fn parse_elevation_output(stdout: &str) -> Result<bool, String> {
+    match stdout.trim() {
+        "True" => Ok(true),
+        "False" => Ok(false),
+        other => Err(format!(
+            "unexpected output from privilege check: {:?}",
+            other
+        )),
+    }
+}
+
+fn is_elevated() -> Result<bool, Box<dyn std::error::Error>> {
+    let output = execute_powershell(ELEVATION_CHECK)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    // Mirrors the getters: PowerShell can exit 0 while reporting the real
+    // failure on stderr.
+    if !stderr.is_empty() {
+        return Err(format!("PowerShell error: {}", stderr).into());
+    }
+
+    parse_elevation_output(&stdout).map_err(|e| e.into())
+}
+
 fn get_physical_disks() -> Result<Vec<PhysicalDisk>, Box<dyn std::error::Error>> {
     let output = execute_powershell(
         "$disks = @(Get-Disk | Select-Object Number,FriendlyName,SerialNumber,HealthStatus,\
@@ -346,6 +380,36 @@ ConvertTo-Json -InputObject $volumes",
 }
 
 fn main() {
+    // Administrator privileges are a prerequisite: the disk and BitLocker
+    // inventory below needs an elevated token, and later milestones will perform
+    // operations that must never run unprivileged. Refuse before touching any
+    // disk state. No automatic UAC relaunch yet — detect and stop.
+    match is_elevated() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("E-Waste must be run as Administrator.");
+            eprintln!();
+            eprintln!(
+                "It needs elevated privileges to inspect physical disks and BitLocker state."
+            );
+            eprintln!(
+                "Close this window, right-click your terminal (PowerShell or Windows Terminal),"
+            );
+            eprintln!("choose \"Run as administrator\", then run E-Waste again.");
+            eprintln!();
+            eprintln!("No disks have been inspected or changed.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "E-Waste could not determine whether it is running with administrator privileges: {}",
+                e
+            );
+            eprintln!("Refusing to continue. No disks have been inspected or changed.");
+            std::process::exit(1);
+        }
+    }
+
     let disks_result = get_physical_disks();
     let partitions_result = get_partitions();
     let bitlocker_result = get_bitlocker_volumes();
@@ -584,6 +648,31 @@ mod tests {
             volume_type: "Data".to_string(),
             capacity_gb: 100.0,
         }
+    }
+
+    #[test]
+    fn elevation_output_true_is_elevated() {
+        assert_eq!(parse_elevation_output("True\r\n"), Ok(true));
+    }
+
+    #[test]
+    fn elevation_output_false_is_not_elevated() {
+        assert_eq!(parse_elevation_output("False\n"), Ok(false));
+    }
+
+    #[test]
+    fn elevation_output_tolerates_surrounding_whitespace() {
+        assert_eq!(parse_elevation_output("  True  "), Ok(true));
+    }
+
+    #[test]
+    fn elevation_output_empty_is_error() {
+        assert!(parse_elevation_output("").is_err());
+    }
+
+    #[test]
+    fn elevation_output_unexpected_text_is_error() {
+        assert!(parse_elevation_output("Access is denied.").is_err());
     }
 
     #[test]
