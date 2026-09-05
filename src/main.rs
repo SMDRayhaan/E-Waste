@@ -36,6 +36,12 @@ struct Partition {
     drive_letter: Option<char>,
     #[serde(rename = "Type")]
     partition_type: String,
+    // Every mount point Windows knows for this partition: the drive-letter root
+    // ("C:\\"), the volume GUID root ("\\\\?\\Volume{...}\\") and any folder mount
+    // points. This is what correlates an arbitrary path back to a physical disk --
+    // a drive letter alone cannot resolve a VSS VolumeName or a letterless volume.
+    #[serde(rename = "AccessPaths")]
+    access_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +274,481 @@ fn verify_target_before_operation<'a>(
     }
 }
 
+// --- M-2: extended pre-flight ------------------------------------------------
+//
+// A second, independent read-only layer on top of M-1's static eligibility gate.
+// M-1 answers "could this disk be a target at all?" (boot/system flags,
+// BitLocker); M-2 answers "is Windows using this disk right now?". Nothing here
+// writes, and nothing here is wired to a destructive operation — it only produces
+// evidence.
+
+// The variant order IS the combination rule: a report's status is the maximum of
+// its findings, so Blocked dominates Unknown and Unknown dominates Safe. A check
+// that cannot be answered can never be promoted to Safe by other checks passing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PreflightStatus {
+    Safe,
+    Unknown,
+    Blocked,
+}
+
+impl PreflightStatus {
+    fn label(self) -> &'static str {
+        match self {
+            PreflightStatus::Safe => "SAFE",
+            PreflightStatus::Unknown => "UNKNOWN",
+            PreflightStatus::Blocked => "BLOCKED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflightCheck {
+    Pagefile,
+    Hibernation,
+    CrashDump,
+    ShadowCopy,
+    ExecutableLocation,
+}
+
+impl PreflightCheck {
+    fn label(self) -> &'static str {
+        match self {
+            PreflightCheck::Pagefile => "Pagefile",
+            PreflightCheck::Hibernation => "Hibernation",
+            PreflightCheck::CrashDump => "Crash Dump",
+            PreflightCheck::ShadowCopy => "Shadow Copies",
+            PreflightCheck::ExecutableLocation => "Executable Location",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreflightFinding {
+    check: PreflightCheck,
+    status: PreflightStatus,
+    detail: String,
+}
+
+#[derive(Debug)]
+struct PreflightReport {
+    findings: Vec<PreflightFinding>,
+}
+
+impl PreflightReport {
+    fn status(&self) -> PreflightStatus {
+        // A report with no findings is not evidence of safety, so an empty report
+        // falls to Unknown rather than the Safe that max() would otherwise imply.
+        self.findings
+            .iter()
+            .map(|f| f.status)
+            .max()
+            .unwrap_or(PreflightStatus::Unknown)
+    }
+}
+
+// The Option fields below keep "Windows reported this value" distinguishable from
+// "the value was absent or unreadable". The second case must surface as Unknown;
+// it must never fall back to a default that reads as Safe.
+#[derive(Debug, Deserialize)]
+struct PageFile {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Source")]
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Hibernation {
+    #[serde(rename = "HibernateEnabled")]
+    enabled: Option<u32>,
+    #[serde(rename = "SystemDrive")]
+    system_drive: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrashDump {
+    #[serde(rename = "CrashDumpEnabled")]
+    enabled: Option<u32>,
+    #[serde(rename = "DumpFile")]
+    dump_file: Option<String>,
+    #[serde(rename = "MinidumpDir")]
+    minidump_dir: Option<String>,
+    // Set, this overrides DumpFile and can put the kernel dump on an entirely
+    // different volume, so it has to be correlated too. Usually absent.
+    #[serde(rename = "DedicatedDumpFile")]
+    dedicated_dump_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowCopy {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "VolumeName")]
+    volume_name: String,
+}
+
+// One Result per check, deliberately not one combined query: a single failing
+// provider must degrade exactly one check to Unknown rather than collapsing all
+// five into a single uninformative failure.
+struct SystemUsage {
+    pagefiles: Result<Vec<PageFile>, Box<dyn std::error::Error>>,
+    hibernation: Result<Hibernation, Box<dyn std::error::Error>>,
+    crash_dump: Result<CrashDump, Box<dyn std::error::Error>>,
+    shadow_copies: Result<Vec<ShadowCopy>, Box<dyn std::error::Error>>,
+    exe_path: Result<String, Box<dyn std::error::Error>>,
+}
+
+// Lowercase, forward slashes folded to backslashes, exactly one trailing
+// backslash, so that "C:", "c:\", "C:/" and a volume GUID root all compare
+// predictably.
+fn normalize_path(path: &str) -> String {
+    let lowered = path.trim().to_lowercase().replace('/', "\\");
+    format!("{}\\", lowered.trim_end_matches('\\'))
+}
+
+// Resolves a filesystem path to the physical disk(s) hosting it, via the longest
+// matching AccessPath. Longest wins so a volume mounted at C:\mnt\data claims the
+// paths beneath it instead of the C:\ root volume; matching on a drive letter alone
+// would attribute those to the wrong physical disk.
+//
+// Every disk tied at that longest match is returned, not just the first one: a
+// single volume can live on several physical disks (a dynamic mirrored or striped
+// volume puts the same access path on a partition of each), and every one of them
+// genuinely holds the data. Naming only one would let the others report as unused.
+//
+// An empty result means no partition claims the path. Callers must treat that as
+// unknown, never as "not on the target disk".
+//
+// Known limitation: for a Storage Spaces volume, Get-Partition reports the virtual
+// disk's number, so the physical member disks are not correlated here at all.
+fn resolve_path_to_disks(path: &str, partitions: &[Partition]) -> Vec<u32> {
+    let needle = normalize_path(path);
+    let mut best_len = 0;
+    let mut disks: Vec<u32> = Vec::new();
+
+    for partition in partitions {
+        let Some(access_paths) = &partition.access_paths else {
+            continue;
+        };
+
+        for access_path in access_paths {
+            let root = normalize_path(access_path);
+
+            // An empty access path normalizes to a bare separator, which would
+            // otherwise match every path on the system.
+            if root.len() <= 1 || !needle.starts_with(&root) {
+                continue;
+            }
+
+            if root.len() > best_len {
+                best_len = root.len();
+                disks.clear();
+            }
+
+            if root.len() == best_len && !disks.contains(&partition.disk_number) {
+                disks.push(partition.disk_number);
+            }
+        }
+    }
+
+    disks
+}
+
+// The shared shape of the path-based checks: any path on the target disk blocks;
+// any path that resolves to no disk at all is Unknown; only a set that fully
+// resolves and lands entirely off the target is Safe.
+fn classify_paths(
+    check: PreflightCheck,
+    disk_number: u32,
+    partitions: &[Partition],
+    paths: &[(String, String)],
+    safe_detail: &str,
+) -> PreflightFinding {
+    let mut on_target: Vec<String> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for (description, path) in paths {
+        let hosts = resolve_path_to_disks(path, partitions);
+
+        if hosts.is_empty() {
+            unresolved.push(format!("{} {}", description, path));
+        } else if hosts.contains(&disk_number) {
+            // Blocks whenever the target is one of the hosts, so a volume spread
+            // across several disks blocks every disk it occupies.
+            on_target.push(format!("{} {}", description, path));
+        }
+    }
+
+    if !on_target.is_empty() {
+        return PreflightFinding {
+            check,
+            status: PreflightStatus::Blocked,
+            detail: format!("on disk {}: {}", disk_number, on_target.join("; ")),
+        };
+    }
+
+    if !unresolved.is_empty() {
+        return PreflightFinding {
+            check,
+            status: PreflightStatus::Unknown,
+            detail: format!(
+                "could not be resolved to a physical disk: {}",
+                unresolved.join("; ")
+            ),
+        };
+    }
+
+    PreflightFinding {
+        check,
+        status: PreflightStatus::Safe,
+        detail: safe_detail.to_string(),
+    }
+}
+
+fn unknown_finding(check: PreflightCheck, detail: String) -> PreflightFinding {
+    PreflightFinding {
+        check,
+        status: PreflightStatus::Unknown,
+        detail,
+    }
+}
+
+fn safe_finding(check: PreflightCheck, detail: &str) -> PreflightFinding {
+    PreflightFinding {
+        check,
+        status: PreflightStatus::Safe,
+        detail: detail.to_string(),
+    }
+}
+
+fn evaluate_pagefile(
+    disk_number: u32,
+    partitions: &[Partition],
+    usage: &SystemUsage,
+) -> PreflightFinding {
+    let pagefiles = match &usage.pagefiles {
+        Ok(pagefiles) => pagefiles,
+        Err(e) => {
+            return unknown_finding(
+                PreflightCheck::Pagefile,
+                format!("pagefile information unavailable: {}", e),
+            );
+        }
+    };
+
+    if pagefiles.is_empty() {
+        return safe_finding(
+            PreflightCheck::Pagefile,
+            "no pagefile is in use or configured on this system",
+        );
+    }
+
+    let paths: Vec<(String, String)> = pagefiles
+        .iter()
+        .map(|p| (format!("{} pagefile", p.source), p.name.clone()))
+        .collect();
+
+    classify_paths(
+        PreflightCheck::Pagefile,
+        disk_number,
+        partitions,
+        &paths,
+        "no pagefile resolves to this disk",
+    )
+}
+
+fn evaluate_hibernation(
+    disk_number: u32,
+    partitions: &[Partition],
+    usage: &SystemUsage,
+) -> PreflightFinding {
+    let hibernation = match &usage.hibernation {
+        Ok(hibernation) => hibernation,
+        Err(e) => {
+            return unknown_finding(
+                PreflightCheck::Hibernation,
+                format!("hibernation state unavailable: {}", e),
+            );
+        }
+    };
+
+    // HibernateEnabled is the DWORD powercfg writes: 0 off, non-zero on. Absent
+    // means unreadable, not off — inferring the answer from the presence of
+    // hiberfil.sys would be a heuristic, so it stays Unknown.
+    let Some(enabled) = hibernation.enabled else {
+        return unknown_finding(
+            PreflightCheck::Hibernation,
+            "HibernateEnabled is absent or unreadable".to_string(),
+        );
+    };
+
+    if enabled == 0 {
+        return safe_finding(
+            PreflightCheck::Hibernation,
+            "hibernation is disabled (HibernateEnabled = 0)",
+        );
+    }
+
+    // hiberfil.sys lives on the system volume, so hibernation only concerns the
+    // target disk when that volume belongs to it.
+    let Some(system_drive) = hibernation.system_drive.as_deref() else {
+        return unknown_finding(
+            PreflightCheck::Hibernation,
+            "hibernation is enabled but the system drive could not be determined".to_string(),
+        );
+    };
+
+    classify_paths(
+        PreflightCheck::Hibernation,
+        disk_number,
+        partitions,
+        &[(
+            "hibernation system volume (hiberfil.sys)".to_string(),
+            system_drive.to_string(),
+        )],
+        "hibernation is enabled, but the system volume is not on this disk",
+    )
+}
+
+fn evaluate_crash_dump(
+    disk_number: u32,
+    partitions: &[Partition],
+    usage: &SystemUsage,
+) -> PreflightFinding {
+    let crash_dump = match &usage.crash_dump {
+        Ok(crash_dump) => crash_dump,
+        Err(e) => {
+            return unknown_finding(
+                PreflightCheck::CrashDump,
+                format!("crash dump configuration unavailable: {}", e),
+            );
+        }
+    };
+
+    let Some(enabled) = crash_dump.enabled else {
+        return unknown_finding(
+            PreflightCheck::CrashDump,
+            "CrashDumpEnabled is absent or unreadable".to_string(),
+        );
+    };
+
+    if enabled == 0 {
+        return safe_finding(
+            PreflightCheck::CrashDump,
+            "crash dumps are disabled (CrashDumpEnabled = 0)",
+        );
+    }
+
+    let mut paths: Vec<(String, String)> = Vec::new();
+    if let Some(dump_file) = &crash_dump.dump_file {
+        paths.push(("dump file".to_string(), dump_file.clone()));
+    }
+    if let Some(minidump_dir) = &crash_dump.minidump_dir {
+        paths.push(("minidump directory".to_string(), minidump_dir.clone()));
+    }
+    if let Some(dedicated) = &crash_dump.dedicated_dump_file {
+        paths.push(("dedicated dump file".to_string(), dedicated.clone()));
+    }
+
+    if paths.is_empty() {
+        return unknown_finding(
+            PreflightCheck::CrashDump,
+            format!(
+                "crash dumps are enabled (CrashDumpEnabled = {}) but no dump path is configured",
+                enabled
+            ),
+        );
+    }
+
+    classify_paths(
+        PreflightCheck::CrashDump,
+        disk_number,
+        partitions,
+        &paths,
+        "no configured crash dump path resolves to this disk",
+    )
+}
+
+fn evaluate_shadow_copies(
+    disk_number: u32,
+    partitions: &[Partition],
+    usage: &SystemUsage,
+) -> PreflightFinding {
+    let shadow_copies = match &usage.shadow_copies {
+        Ok(shadow_copies) => shadow_copies,
+        Err(e) => {
+            return unknown_finding(
+                PreflightCheck::ShadowCopy,
+                format!("shadow copy enumeration unavailable: {}", e),
+            );
+        }
+    };
+
+    if shadow_copies.is_empty() {
+        return safe_finding(
+            PreflightCheck::ShadowCopy,
+            "no shadow copies exist on this system",
+        );
+    }
+
+    let paths: Vec<(String, String)> = shadow_copies
+        .iter()
+        .map(|s| (format!("shadow copy {} on", s.id), s.volume_name.clone()))
+        .collect();
+
+    classify_paths(
+        PreflightCheck::ShadowCopy,
+        disk_number,
+        partitions,
+        &paths,
+        "no shadow copy resolves to this disk",
+    )
+}
+
+fn evaluate_executable_location(
+    disk_number: u32,
+    partitions: &[Partition],
+    usage: &SystemUsage,
+) -> PreflightFinding {
+    let exe_path = match &usage.exe_path {
+        Ok(exe_path) => exe_path,
+        Err(e) => {
+            return unknown_finding(
+                PreflightCheck::ExecutableLocation,
+                format!("E-Waste executable location unavailable: {}", e),
+            );
+        }
+    };
+
+    classify_paths(
+        PreflightCheck::ExecutableLocation,
+        disk_number,
+        partitions,
+        &[("E-Waste executable".to_string(), exe_path.clone())],
+        "E-Waste is not running from this disk",
+    )
+}
+
+// Pure: no Windows I/O, so the whole safety decision is unit-testable. Emits
+// exactly one finding per check, in a fixed order, so the combined result is
+// deterministic and no check can be silently omitted from the report.
+fn evaluate_preflight(
+    disk_number: u32,
+    partitions: &[Partition],
+    usage: &SystemUsage,
+) -> PreflightReport {
+    PreflightReport {
+        findings: vec![
+            evaluate_pagefile(disk_number, partitions, usage),
+            evaluate_hibernation(disk_number, partitions, usage),
+            evaluate_crash_dump(disk_number, partitions, usage),
+            evaluate_shadow_copies(disk_number, partitions, usage),
+            evaluate_executable_location(disk_number, partitions, usage),
+        ],
+    }
+}
+
 fn execute_powershell(command: &str) -> Result<Output, Box<dyn std::error::Error>> {
     Command::new(POWERSHELL_PATH)
         .args(["-NoProfile", "-Command", command])
@@ -330,7 +811,8 @@ ConvertTo-Json -InputObject $disks",
 
 fn get_partitions() -> Result<Vec<Partition>, Box<dyn std::error::Error>> {
     let output = execute_powershell(
-        "$partitions = @(Get-Partition | Select-Object DiskNumber,DriveLetter,Type); \
+        "$partitions = @(Get-Partition | \
+Select-Object DiskNumber,DriveLetter,Type,AccessPaths); \
 ConvertTo-Json -InputObject $partitions",
     )?;
 
@@ -377,6 +859,134 @@ ConvertTo-Json -InputObject $volumes",
 
     let volumes: Vec<BitLockerVolume> = serde_json::from_str(&stdout)?;
     Ok(volumes)
+}
+
+// Runs a read-only PowerShell query and returns its trimmed stdout.
+//
+// The stderr guard is load-bearing, not defensive noise: a failing CIM provider
+// exits 0, writes the real error to stderr, and still prints an empty JSON array
+// to stdout. Verified on this machine — Win32_ShadowCopy failing with
+// WBEM_E_PROVIDER_LOAD_FAILURE emits exactly the same "[]" as a system with no
+// shadow copies. stdout alone cannot tell "failed" from "nothing found", so a
+// non-empty stderr is the only thing standing between a failed query and a
+// silent, falsely reassuring "nothing detected".
+//
+// ponytail: the three M-1 getters still inline this same guard. Folding them in
+// is a behaviour-preserving cleanup, deliberately deferred so M-2 leaves M-1
+// byte-for-byte unchanged.
+fn powershell_json(command: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = execute_powershell(command)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !stderr.is_empty() {
+        return Err(format!("PowerShell error: {}", stderr).into());
+    }
+
+    Ok(stdout)
+}
+
+// Two sources, because they answer different questions: Win32_PageFileUsage is
+// what is paging right now, Win32_PageFileSetting is what is configured. With an
+// automatically managed pagefile the Setting class reports nothing, so neither
+// class alone is sufficient. A configured-but-not-yet-active pagefile on the
+// target disk is still a reason to refuse.
+fn get_pagefiles() -> Result<Vec<PageFile>, Box<dyn std::error::Error>> {
+    let stdout = powershell_json(
+        "$rows = @(); \
+$rows += @(Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction Stop | \
+ForEach-Object { [pscustomobject]@{Name=$_.Name; Source='in-use'} }); \
+$rows += @(Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction Stop | \
+ForEach-Object { [pscustomobject]@{Name=$_.Name; Source='configured'} }); \
+ConvertTo-Json -InputObject @($rows)",
+    )?;
+
+    // A successful query never lands here: ConvertTo-Json emits "[]" for an empty
+    // result set, so empty output means the query failed without writing to stderr.
+    // Reporting that as an empty list would turn a failure into "no pagefile found".
+    if stdout.is_empty() {
+        return Err("pagefile query returned no output".into());
+    }
+
+    let pagefiles: Vec<PageFile> = serde_json::from_str(&stdout)?;
+    Ok(pagefiles)
+}
+
+// HibernateEnabled is the value powercfg /hibernate writes. SystemDrive comes
+// along in the same query because hiberfil.sys always lives on the system volume,
+// and that volume is what has to be correlated back to a physical disk.
+fn get_hibernation() -> Result<Hibernation, Box<dyn std::error::Error>> {
+    let stdout = powershell_json(
+        "$power = Get-ItemProperty -Path \
+'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power' -ErrorAction Stop; \
+ConvertTo-Json -InputObject ([pscustomobject]@{\
+HibernateEnabled=$power.HibernateEnabled; SystemDrive=$env:SystemDrive})",
+    )?;
+
+    if stdout.is_empty() {
+        return Err("hibernation query returned no output".into());
+    }
+
+    let hibernation: Hibernation = serde_json::from_str(&stdout)?;
+    Ok(hibernation)
+}
+
+fn get_crash_dump() -> Result<CrashDump, Box<dyn std::error::Error>> {
+    let stdout = powershell_json(
+        "$crash = Get-ItemProperty -Path \
+'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\CrashControl' -ErrorAction Stop; \
+ConvertTo-Json -InputObject ([pscustomobject]@{\
+CrashDumpEnabled=$crash.CrashDumpEnabled; DumpFile=$crash.DumpFile; \
+MinidumpDir=$crash.MinidumpDir; DedicatedDumpFile=$crash.DedicatedDumpFile})",
+    )?;
+
+    if stdout.is_empty() {
+        return Err("crash dump query returned no output".into());
+    }
+
+    let crash_dump: CrashDump = serde_json::from_str(&stdout)?;
+    Ok(crash_dump)
+}
+
+// Enumerates existing shadow copies. VolumeName is a volume GUID root, which is
+// why AccessPaths rather than drive letters is the correlation key: a shadow copy
+// on a letterless volume is still a shadow copy.
+//
+// Read-only: this never deletes, resizes or reverts a shadow copy.
+fn get_shadow_copies() -> Result<Vec<ShadowCopy>, Box<dyn std::error::Error>> {
+    let stdout = powershell_json(
+        "$shadows = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop | \
+Select-Object ID,VolumeName); ConvertTo-Json -InputObject $shadows",
+    )?;
+
+    // As in get_pagefiles(): empty output cannot come from a successful query, so it
+    // must not be reported as "no shadow copies exist".
+    if stdout.is_empty() {
+        return Err("shadow copy query returned no output".into());
+    }
+
+    let shadow_copies: Vec<ShadowCopy> = serde_json::from_str(&stdout)?;
+    Ok(shadow_copies)
+}
+
+// A UNC path (\\server\share\...) or a verbatim path (\\?\C:\...) matches no
+// AccessPath and so reports Unknown rather than Safe. That errs in the conservative
+// direction, which is the correct way to be wrong here.
+fn get_executable_path() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(std::env::current_exe()?.to_string_lossy().to_string())
+}
+
+// Collected once per run and shared across every disk: these are system-wide
+// facts, and re-querying per disk would let the answers drift mid-report.
+fn collect_system_usage() -> SystemUsage {
+    SystemUsage {
+        pagefiles: get_pagefiles(),
+        hibernation: get_hibernation(),
+        crash_dump: get_crash_dump(),
+        shadow_copies: get_shadow_copies(),
+        exe_path: get_executable_path(),
+    }
 }
 
 fn main() {
@@ -565,6 +1175,47 @@ fn main() {
         }
         (Err(e), _) => eprintln!("Error getting disk information: {}", e),
     }
+
+    // M-2: read-only usage detection. Reports only -- no disk, volume, service,
+    // BitLocker or hibernation state is touched, and nothing here gates a
+    // destructive operation, because there is not one yet.
+    println!("=== Extended Pre-Flight (read-only) ===");
+    match (&disks_result, &partitions_result) {
+        (Ok(disks), Ok(partitions)) => {
+            if disks.is_empty() {
+                println!("No physical disks found.");
+            }
+
+            // Collected once: these are system-wide facts, and re-querying per
+            // disk would let the answers drift mid-report.
+            let usage = collect_system_usage();
+
+            for disk in disks {
+                println!("Disk {}", disk.number);
+
+                let report = evaluate_preflight(disk.number, partitions, &usage);
+                for finding in &report.findings {
+                    println!(
+                        "  {:<21}{:<9}{}",
+                        format!("{}:", finding.check.label()),
+                        finding.status.label(),
+                        finding.detail
+                    );
+                }
+                println!("  Result: {}", report.status().label());
+            }
+        }
+        (Ok(disks), Err(e)) => {
+            for disk in disks {
+                println!(
+                    "Disk {}: UNKNOWN: partition information is unavailable, so no path can \
+be correlated to a physical disk: {}",
+                    disk.number, e
+                );
+            }
+        }
+        (Err(e), _) => eprintln!("Error getting disk information: {}", e),
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +1287,7 @@ mod tests {
             disk_number: 0,
             drive_letter,
             partition_type: "Basic".to_string(),
+            access_paths: drive_letter.map(|l| vec![format!("{}:\\", l)]),
         }
     }
 
@@ -1106,5 +1758,688 @@ mod tests {
         let verified = result.expect("matching disk should verify");
         assert_eq!(verified.health_status, "Warning");
         assert!(std::ptr::eq(verified, &fresh_disks[0]));
+    }
+
+    // --- M-2: extended pre-flight -------------------------------------------
+
+    // Two-disk fixture. Disk 0 holds C:, disk 1 is the target under test and holds
+    // E:. Both carry a volume GUID access path, as real partitions do.
+    const TARGET: u32 = 1;
+    const OTHER_GUID: &str = "\\\\?\\Volume{aaaaaaaa-0000-0000-0000-000000000000}\\";
+    const TARGET_GUID: &str = "\\\\?\\Volume{bbbbbbbb-0000-0000-0000-000000000000}\\";
+
+    fn make_partition_on(disk_number: u32, access_paths: &[&str]) -> Partition {
+        Partition {
+            disk_number,
+            drive_letter: None,
+            partition_type: "Basic".to_string(),
+            access_paths: Some(access_paths.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn preflight_partitions() -> Vec<Partition> {
+        vec![
+            make_partition_on(0, &["C:\\", OTHER_GUID]),
+            make_partition_on(TARGET, &["E:\\", TARGET_GUID]),
+        ]
+    }
+
+    // Deliberately not an empty system: every check has real data, all of it on
+    // disk 0. A fixture of empty vectors would pass the "safe" test without
+    // proving the checks discriminate between disks at all.
+    fn safe_usage() -> SystemUsage {
+        SystemUsage {
+            pagefiles: Ok(vec![PageFile {
+                name: "C:\\pagefile.sys".to_string(),
+                source: "in-use".to_string(),
+            }]),
+            hibernation: Ok(Hibernation {
+                enabled: Some(0),
+                system_drive: Some("C:".to_string()),
+            }),
+            crash_dump: Ok(CrashDump {
+                enabled: Some(3),
+                dump_file: Some("C:\\WINDOWS\\MEMORY.DMP".to_string()),
+                minidump_dir: Some("C:\\WINDOWS\\Minidump".to_string()),
+                dedicated_dump_file: None,
+            }),
+            shadow_copies: Ok(vec![ShadowCopy {
+                id: "{11111111-0000-0000-0000-000000000000}".to_string(),
+                volume_name: OTHER_GUID.to_string(),
+            }]),
+            exe_path: Ok("C:\\tools\\e-waste.exe".to_string()),
+        }
+    }
+
+    fn finding_for(report: &PreflightReport, check: PreflightCheck) -> &PreflightFinding {
+        report
+            .findings
+            .iter()
+            .find(|f| f.check == check)
+            .expect("every check must produce exactly one finding")
+    }
+
+    fn status_of(usage: &SystemUsage, check: PreflightCheck) -> PreflightStatus {
+        let partitions = preflight_partitions();
+        let report = evaluate_preflight(TARGET, &partitions, usage);
+        finding_for(&report, check).status
+    }
+
+    #[test]
+    fn preflight_with_no_usage_on_target_is_safe() {
+        let partitions = preflight_partitions();
+        let report = evaluate_preflight(TARGET, &partitions, &safe_usage());
+
+        assert_eq!(report.status(), PreflightStatus::Safe);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.status == PreflightStatus::Safe),
+            "expected every finding to be safe, got {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn every_check_produces_exactly_one_finding_in_fixed_order() {
+        let partitions = preflight_partitions();
+        let report = evaluate_preflight(TARGET, &partitions, &safe_usage());
+
+        let checks: Vec<PreflightCheck> = report.findings.iter().map(|f| f.check).collect();
+        assert_eq!(
+            checks,
+            vec![
+                PreflightCheck::Pagefile,
+                PreflightCheck::Hibernation,
+                PreflightCheck::CrashDump,
+                PreflightCheck::ShadowCopy,
+                PreflightCheck::ExecutableLocation,
+            ]
+        );
+    }
+
+    #[test]
+    fn pagefile_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.pagefiles = Ok(vec![PageFile {
+            name: "E:\\pagefile.sys".to_string(),
+            source: "in-use".to_string(),
+        }]);
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Pagefile),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn configured_but_inactive_pagefile_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.pagefiles = Ok(vec![PageFile {
+            name: "E:\\pagefile.sys".to_string(),
+            source: "configured".to_string(),
+        }]);
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Pagefile),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn pagefile_on_another_disk_is_safe() {
+        assert_eq!(
+            status_of(&safe_usage(), PreflightCheck::Pagefile),
+            PreflightStatus::Safe
+        );
+    }
+
+    #[test]
+    fn pagefile_query_failure_is_unknown() {
+        let mut usage = safe_usage();
+        usage.pagefiles = Err("simulated failure".into());
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Pagefile),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn hibernation_enabled_with_system_volume_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.hibernation = Ok(Hibernation {
+            enabled: Some(1),
+            system_drive: Some("E:".to_string()),
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Hibernation),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn hibernation_enabled_with_system_volume_elsewhere_is_safe() {
+        let mut usage = safe_usage();
+        usage.hibernation = Ok(Hibernation {
+            enabled: Some(1),
+            system_drive: Some("C:".to_string()),
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Hibernation),
+            PreflightStatus::Safe
+        );
+    }
+
+    #[test]
+    fn hibernation_disabled_is_safe() {
+        assert_eq!(
+            status_of(&safe_usage(), PreflightCheck::Hibernation),
+            PreflightStatus::Safe
+        );
+    }
+
+    #[test]
+    fn hibernation_registry_value_absent_is_unknown() {
+        let mut usage = safe_usage();
+        usage.hibernation = Ok(Hibernation {
+            enabled: None,
+            system_drive: Some("C:".to_string()),
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Hibernation),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn hibernation_enabled_without_system_drive_is_unknown() {
+        let mut usage = safe_usage();
+        usage.hibernation = Ok(Hibernation {
+            enabled: Some(1),
+            system_drive: None,
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Hibernation),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn hibernation_query_failure_is_unknown() {
+        let mut usage = safe_usage();
+        usage.hibernation = Err("simulated failure".into());
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Hibernation),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn crash_dump_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Ok(CrashDump {
+            enabled: Some(3),
+            dump_file: Some("E:\\dumps\\MEMORY.DMP".to_string()),
+            minidump_dir: None,
+            dedicated_dump_file: None,
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn crash_dump_minidump_directory_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Ok(CrashDump {
+            enabled: Some(3),
+            dump_file: Some("C:\\WINDOWS\\MEMORY.DMP".to_string()),
+            minidump_dir: Some("E:\\Minidump".to_string()),
+            dedicated_dump_file: None,
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn crash_dump_disabled_is_safe() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Ok(CrashDump {
+            enabled: Some(0),
+            dump_file: Some("E:\\dumps\\MEMORY.DMP".to_string()),
+            minidump_dir: Some("E:\\Minidump".to_string()),
+            dedicated_dump_file: None,
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Safe
+        );
+    }
+
+    #[test]
+    fn crash_dump_enabled_without_any_path_is_unknown() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Ok(CrashDump {
+            enabled: Some(3),
+            dump_file: None,
+            minidump_dir: None,
+            dedicated_dump_file: None,
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn crash_dump_registry_value_absent_is_unknown() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Ok(CrashDump {
+            enabled: None,
+            dump_file: Some("C:\\WINDOWS\\MEMORY.DMP".to_string()),
+            minidump_dir: None,
+            dedicated_dump_file: None,
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn crash_dump_query_failure_is_unknown() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Err("simulated failure".into());
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn shadow_copy_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.shadow_copies = Ok(vec![ShadowCopy {
+            id: "{22222222-0000-0000-0000-000000000000}".to_string(),
+            volume_name: TARGET_GUID.to_string(),
+        }]);
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::ShadowCopy),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn shadow_copy_on_another_disk_is_safe() {
+        assert_eq!(
+            status_of(&safe_usage(), PreflightCheck::ShadowCopy),
+            PreflightStatus::Safe
+        );
+    }
+
+    #[test]
+    fn no_shadow_copies_is_safe() {
+        let mut usage = safe_usage();
+        usage.shadow_copies = Ok(vec![]);
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::ShadowCopy),
+            PreflightStatus::Safe
+        );
+    }
+
+    // The case that actually happens on a machine with the VSS service stopped:
+    // the query fails while still printing an empty array. It must not read as
+    // "no shadow copies".
+    #[test]
+    fn shadow_copy_query_failure_is_unknown_not_safe() {
+        let mut usage = safe_usage();
+        usage.shadow_copies = Err("simulated provider load failure".into());
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::ShadowCopy),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn executable_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.exe_path = Ok("E:\\tools\\e-waste.exe".to_string());
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::ExecutableLocation),
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn executable_on_another_disk_is_safe() {
+        assert_eq!(
+            status_of(&safe_usage(), PreflightCheck::ExecutableLocation),
+            PreflightStatus::Safe
+        );
+    }
+
+    #[test]
+    fn executable_path_unavailable_is_unknown() {
+        let mut usage = safe_usage();
+        usage.exe_path = Err("simulated failure".into());
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::ExecutableLocation),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn path_on_an_unknown_volume_is_unknown_not_safe() {
+        let mut usage = safe_usage();
+        usage.pagefiles = Ok(vec![PageFile {
+            name: "Z:\\pagefile.sys".to_string(),
+            source: "in-use".to_string(),
+        }]);
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::Pagefile),
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn a_single_unknown_keeps_the_whole_report_off_safe() {
+        let mut usage = safe_usage();
+        usage.shadow_copies = Err("simulated failure".into());
+
+        let partitions = preflight_partitions();
+        let report = evaluate_preflight(TARGET, &partitions, &usage);
+
+        assert_eq!(report.status(), PreflightStatus::Unknown);
+    }
+
+    #[test]
+    fn blocked_dominates_unknown_and_safe() {
+        let mut usage = safe_usage();
+        usage.shadow_copies = Err("simulated failure".into());
+        usage.exe_path = Ok("E:\\tools\\e-waste.exe".to_string());
+
+        let partitions = preflight_partitions();
+        let report = evaluate_preflight(TARGET, &partitions, &usage);
+
+        assert_eq!(report.status(), PreflightStatus::Blocked);
+        assert_eq!(
+            finding_for(&report, PreflightCheck::ShadowCopy).status,
+            PreflightStatus::Unknown
+        );
+        assert_eq!(
+            finding_for(&report, PreflightCheck::ExecutableLocation).status,
+            PreflightStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn multiple_findings_combine_deterministically() {
+        // Every check fails in a different way at once.
+        let usage = SystemUsage {
+            pagefiles: Ok(vec![PageFile {
+                name: "E:\\pagefile.sys".to_string(),
+                source: "in-use".to_string(),
+            }]),
+            hibernation: Ok(Hibernation {
+                enabled: Some(1),
+                system_drive: Some("E:".to_string()),
+            }),
+            crash_dump: Ok(CrashDump {
+                enabled: Some(3),
+                dump_file: Some("E:\\MEMORY.DMP".to_string()),
+                minidump_dir: None,
+                dedicated_dump_file: None,
+            }),
+            shadow_copies: Err("simulated failure".into()),
+            exe_path: Ok("E:\\tools\\e-waste.exe".to_string()),
+        };
+
+        let partitions = preflight_partitions();
+        let first = evaluate_preflight(TARGET, &partitions, &usage);
+        let second = evaluate_preflight(TARGET, &partitions, &usage);
+
+        assert_eq!(first.status(), PreflightStatus::Blocked);
+
+        let summarize =
+            |report: &PreflightReport| -> Vec<(PreflightCheck, PreflightStatus, String)> {
+                report
+                    .findings
+                    .iter()
+                    .map(|f| (f.check, f.status, f.detail.clone()))
+                    .collect()
+            };
+        assert_eq!(summarize(&first), summarize(&second));
+
+        assert_eq!(
+            first
+                .findings
+                .iter()
+                .filter(|f| f.status == PreflightStatus::Blocked)
+                .count(),
+            4
+        );
+        assert_eq!(
+            finding_for(&first, PreflightCheck::ShadowCopy).status,
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn status_ordering_is_safe_then_unknown_then_blocked() {
+        assert!(PreflightStatus::Safe < PreflightStatus::Unknown);
+        assert!(PreflightStatus::Unknown < PreflightStatus::Blocked);
+    }
+
+    #[test]
+    fn empty_report_is_unknown_not_safe() {
+        let report = PreflightReport {
+            findings: Vec::new(),
+        };
+
+        assert_eq!(report.status(), PreflightStatus::Unknown);
+    }
+
+    #[test]
+    fn resolve_matches_drive_letter_root() {
+        let partitions = preflight_partitions();
+
+        assert_eq!(
+            resolve_path_to_disks("E:\\pagefile.sys", &partitions),
+            vec![TARGET]
+        );
+    }
+
+    #[test]
+    fn resolve_matches_volume_guid_root() {
+        let partitions = preflight_partitions();
+
+        assert_eq!(
+            resolve_path_to_disks(TARGET_GUID, &partitions),
+            vec![TARGET]
+        );
+    }
+
+    #[test]
+    fn resolve_is_case_and_separator_insensitive() {
+        let partitions = preflight_partitions();
+
+        assert_eq!(
+            resolve_path_to_disks("e:/WINDOWS/MEMORY.DMP", &partitions),
+            vec![TARGET]
+        );
+    }
+
+    #[test]
+    fn resolve_matches_a_bare_drive_specifier() {
+        let partitions = preflight_partitions();
+
+        assert_eq!(resolve_path_to_disks("E:", &partitions), vec![TARGET]);
+    }
+
+    // The reason AccessPaths is the correlation key rather than the drive letter:
+    // a volume mounted at a folder on C: can live on a different physical disk,
+    // and the longest match has to win.
+    #[test]
+    fn resolve_prefers_the_longest_access_path() {
+        let partitions = vec![
+            make_partition_on(0, &["C:\\"]),
+            make_partition_on(TARGET, &["C:\\mnt\\data\\"]),
+        ];
+
+        assert_eq!(
+            resolve_path_to_disks("C:\\mnt\\data\\pagefile.sys", &partitions),
+            vec![TARGET]
+        );
+        assert_eq!(
+            resolve_path_to_disks("C:\\pagefile.sys", &partitions),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn resolve_returns_none_for_an_unclaimed_path() {
+        let partitions = preflight_partitions();
+
+        assert_eq!(
+            resolve_path_to_disks("Z:\\pagefile.sys", &partitions),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_ignores_partitions_without_access_paths() {
+        let partitions = vec![Partition {
+            disk_number: 0,
+            drive_letter: None,
+            partition_type: "Reserved".to_string(),
+            access_paths: None,
+        }];
+
+        assert_eq!(
+            resolve_path_to_disks("C:\\pagefile.sys", &partitions),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_ignores_an_empty_access_path() {
+        let partitions = vec![make_partition_on(0, &["", "   "])];
+
+        assert_eq!(
+            resolve_path_to_disks("C:\\pagefile.sys", &partitions),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_does_not_match_a_sibling_directory_by_prefix() {
+        let partitions = vec![
+            make_partition_on(0, &["C:\\"]),
+            make_partition_on(TARGET, &["C:\\mnt\\data\\"]),
+        ];
+
+        // "C:\mnt\database" starts with "C:\mnt\data" as raw text but is not
+        // inside that mount point.
+        assert_eq!(
+            resolve_path_to_disks("C:\\mnt\\database\\pagefile.sys", &partitions),
+            vec![0]
+        );
+    }
+
+    // One volume living on two physical disks, as a dynamic mirrored or striped
+    // volume does: the same access path appears on a partition of each disk.
+    fn mirrored_partitions() -> Vec<Partition> {
+        vec![
+            make_partition_on(0, &["E:\\", TARGET_GUID]),
+            make_partition_on(1, &["E:\\", TARGET_GUID]),
+        ]
+    }
+
+    #[test]
+    fn resolve_returns_every_disk_of_a_mirrored_volume() {
+        assert_eq!(
+            resolve_path_to_disks("E:\\pagefile.sys", &mirrored_partitions()),
+            vec![0, 1]
+        );
+    }
+
+    // Both disks genuinely hold the pagefile volume, so naming only the first would
+    // let the second report as unused.
+    #[test]
+    fn mirrored_volume_blocks_every_disk_it_occupies() {
+        let mut usage = safe_usage();
+        usage.pagefiles = Ok(vec![PageFile {
+            name: "E:\\pagefile.sys".to_string(),
+            source: "in-use".to_string(),
+        }]);
+        let partitions = mirrored_partitions();
+
+        for disk_number in [0, 1] {
+            let report = evaluate_preflight(disk_number, &partitions, &usage);
+            assert_eq!(
+                finding_for(&report, PreflightCheck::Pagefile).status,
+                PreflightStatus::Blocked,
+                "disk {} hosts the mirrored pagefile volume and must block",
+                disk_number
+            );
+        }
+    }
+
+    #[test]
+    fn a_tie_does_not_mask_a_longer_nested_mount_point() {
+        let partitions = vec![
+            make_partition_on(0, &["C:\\"]),
+            make_partition_on(1, &["C:\\"]),
+            make_partition_on(2, &["C:\\mnt\\data\\"]),
+        ];
+
+        assert_eq!(
+            resolve_path_to_disks("C:\\mnt\\data\\pagefile.sys", &partitions),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_path_to_disks("C:\\pagefile.sys", &partitions),
+            vec![0, 1]
+        );
+    }
+
+    // DumpFile points somewhere harmless while DedicatedDumpFile, which overrides
+    // it, points at the target.
+    #[test]
+    fn dedicated_dump_file_on_target_is_blocked() {
+        let mut usage = safe_usage();
+        usage.crash_dump = Ok(CrashDump {
+            enabled: Some(3),
+            dump_file: Some("C:\\WINDOWS\\MEMORY.DMP".to_string()),
+            minidump_dir: Some("C:\\WINDOWS\\Minidump".to_string()),
+            dedicated_dump_file: Some("E:\\dedicated.sys".to_string()),
+        });
+
+        assert_eq!(
+            status_of(&usage, PreflightCheck::CrashDump),
+            PreflightStatus::Blocked
+        );
     }
 }
