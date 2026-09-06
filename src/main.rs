@@ -64,6 +64,18 @@ fn is_system_disk(disk: &PhysicalDisk) -> bool {
     disk.is_boot || disk.is_system
 }
 
+// Get-Partition reports the EFI System Partition, the Microsoft Reserved
+// partition and the WinRE recovery partition with these Type values. All three
+// are legitimately letterless and hold no user data, so a disk that carries only
+// these can still be Eligible. Any other letterless partition is treated as a
+// data volume whose protection state must be proven, not assumed.
+fn is_bare_system_partition(partition_type: &str) -> bool {
+    let t = partition_type.trim();
+    t.eq_ignore_ascii_case("System")
+        || t.eq_ignore_ascii_case("Reserved")
+        || t.eq_ignore_ascii_case("Recovery")
+}
+
 enum Eligibility {
     Eligible,
     Blocked(String),
@@ -79,21 +91,60 @@ fn evaluate_eligibility(
         return Eligibility::Blocked("system/boot disk".to_string());
     }
 
+    // Checked before the loop, not inside it: a failed Get-BitLockerVolume query
+    // is relevant to every disk, so it must not be skipped just because this disk
+    // has no lettered partition to trip the check.
+    let volumes = match bitlocker {
+        Ok(volumes) => volumes,
+        Err(e) => {
+            return Eligibility::Unknown(format!("BitLocker information unavailable: {}", e));
+        }
+    };
+
     for partition in disk_partitions {
         let Some(letter) = partition.drive_letter else {
-            continue;
-        };
-
-        let volumes = match bitlocker {
-            Ok(volumes) => volumes,
-            Err(e) => {
-                return Eligibility::Unknown(format!("BitLocker information unavailable: {}", e));
+            // Letterless. EFI/MSR/Recovery partitions are legitimately letterless
+            // and carry no user data — skip them. Anything else letterless is a
+            // data volume we cannot key to a BitLocker entry (correlation is by
+            // drive letter only), so its protection state is unknown, not "safe".
+            if !is_bare_system_partition(&partition.partition_type) {
+                return Eligibility::Unknown(format!(
+                    "disk {} has a letterless {} partition whose BitLocker state cannot be determined",
+                    disk.number, partition.partition_type
+                ));
             }
+            continue;
         };
 
+        // A drive letter that is not A-Z cannot name a real volume. Get-Partition
+        // types DriveLetter as System.Char, so a partition with no letter
+        // serializes as "\u0000" and deserializes to Some('\0') rather than None,
+        // slipping past the guard above. Fail closed rather than build a key that
+        // matches nothing.
+        if !letter.is_ascii_alphabetic() {
+            return Eligibility::Unknown(format!(
+                "partition on disk {} reports an unusable drive letter {:?}",
+                disk.number, letter
+            ));
+        }
+
+        // Match case-insensitively and tolerate a trailing separator: Get-Partition
+        // and Get-BitLockerVolume do not agree on the case or exact shape of a
+        // mount point ("c:" vs "C:", "C:" vs "C:\\"). An exact == here turns a
+        // BitLocker-protected volume into a silent Eligible when the strings differ.
         let mount_point = format!("{}:", letter);
-        let Some(volume) = volumes.iter().find(|v| v.mount_point == mount_point) else {
-            continue;
+        let Some(volume) = volumes.iter().find(|v| {
+            v.mount_point
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(&mount_point)
+        }) else {
+            // Get-BitLockerVolume lists every fixed volume, protected or not, so a
+            // lettered partition with no entry at all is anomalous: report Unknown
+            // instead of falling through to Eligible.
+            return Eligibility::Unknown(format!(
+                "no BitLocker entry for volume {} on disk {}: protection state unknown",
+                mount_point, disk.number
+            ));
         };
 
         match volume.protection_status.as_str() {
@@ -750,10 +801,28 @@ fn evaluate_preflight(
 }
 
 fn execute_powershell(command: &str) -> Result<Output, Box<dyn std::error::Error>> {
+    // powershell.exe emits the console's OEM/ANSI code page by default, so a
+    // non-ASCII byte in any queried path would reach us as raw non-UTF-8. Force
+    // UTF-8 on the child so decode_powershell_stdout() can be strict.
+    let command = format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+$OutputEncoding=[Text.Encoding]::UTF8; {command}"
+    );
     Command::new(POWERSHELL_PATH)
-        .args(["-NoProfile", "-Command", command])
+        .args(["-NoProfile", "-Command", &command])
         .output()
         .map_err(|e| e.into())
+}
+
+// Strict UTF-8 decode of a PowerShell stdout capture. Unlike from_utf8_lossy, a
+// non-UTF-8 sequence becomes an error (-> Unknown downstream) instead of a
+// U+FFFD-mangled path that resolve_path_to_disks would silently attribute to the
+// wrong physical disk.
+fn decode_powershell_stdout(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok(s.trim().to_string()),
+        Err(_) => Err("PowerShell produced output that was not valid UTF-8".into()),
+    }
 }
 
 // Only "True"/"False" are accepted; anything else (empty output, a PowerShell
@@ -773,7 +842,7 @@ fn parse_elevation_output(stdout: &str) -> Result<bool, String> {
 fn is_elevated() -> Result<bool, Box<dyn std::error::Error>> {
     let output = execute_powershell(ELEVATION_CHECK)?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = decode_powershell_stdout(&output.stdout)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     // Mirrors the getters: PowerShell can exit 0 while reporting the real
@@ -792,7 +861,7 @@ OperationalStatus,IsBoot,IsSystem,@{N='SizeGB';E={[math]::Round($_.Size / 1GB, 2
 ConvertTo-Json -InputObject $disks",
     )?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = decode_powershell_stdout(&output.stdout)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     // Mirrors get_bitlocker_volumes(): a CIM-backed cmdlet can exit 0 while still
@@ -816,7 +885,7 @@ Select-Object DiskNumber,DriveLetter,Type,AccessPaths); \
 ConvertTo-Json -InputObject $partitions",
     )?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = decode_powershell_stdout(&output.stdout)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     // Mirrors get_physical_disks()/get_bitlocker_volumes(): defend against a
@@ -844,7 +913,7 @@ CapacityGB); \
 ConvertTo-Json -InputObject $volumes",
     )?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = decode_powershell_stdout(&output.stdout)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     // Get-BitLockerVolume can exit 0 while still failing internally (e.g. access
@@ -877,7 +946,7 @@ ConvertTo-Json -InputObject $volumes",
 fn powershell_json(command: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = execute_powershell(command)?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = decode_powershell_stdout(&output.stdout)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if !stderr.is_empty() {
@@ -970,11 +1039,22 @@ Select-Object ID,VolumeName); ConvertTo-Json -InputObject $shadows",
     Ok(shadow_copies)
 }
 
+// A Windows path is UTF-16 and may hold sequences with no UTF-8 form (unpaired
+// surrogates). to_string_lossy would replace them with U+FFFD, and the mangled
+// string still prefix-matches a shorter access path -- so classify_paths would
+// name the wrong disk and the true host disk would read Safe. Fail closed on a
+// lossy conversion instead: an unrepresentable path becomes Unknown.
+fn exe_path_to_string(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "executable path is not valid UTF-8".into())
+}
+
 // A UNC path (\\server\share\...) or a verbatim path (\\?\C:\...) matches no
 // AccessPath and so reports Unknown rather than Safe. That errs in the conservative
 // direction, which is the correct way to be wrong here.
 fn get_executable_path() -> Result<String, Box<dyn std::error::Error>> {
-    Ok(std::env::current_exe()?.to_string_lossy().to_string())
+    exe_path_to_string(&std::env::current_exe()?)
 }
 
 // Collected once per run and shared across every disk: these are system-wide
@@ -1291,6 +1371,15 @@ mod tests {
         }
     }
 
+    fn make_letterless_partition(partition_type: &str) -> Partition {
+        Partition {
+            disk_number: 0,
+            drive_letter: None,
+            partition_type: partition_type.to_string(),
+            access_paths: None,
+        }
+    }
+
     fn make_volume(mount_point: &str, protection_status: &str) -> BitLockerVolume {
         BitLockerVolume {
             mount_point: mount_point.to_string(),
@@ -1418,7 +1507,10 @@ mod tests {
     }
 
     #[test]
-    fn partition_with_no_matching_bitlocker_volume_does_not_block() {
+    fn lettered_partition_with_no_bitlocker_entry_is_unknown() {
+        // Get-BitLockerVolume lists every fixed volume, so a lettered partition
+        // with no entry at all is anomalous: fail closed, do not fall through to
+        // Eligible.
         let disk = make_disk(false, false);
         let partition = make_partition(Some('C'));
         let partitions = vec![&partition];
@@ -1426,7 +1518,148 @@ mod tests {
 
         let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
 
+        assert!(matches!(result, Eligibility::Unknown(_)));
+    }
+
+    #[test]
+    fn lowercase_drive_letter_still_matches_protected_volume() {
+        // Get-Partition may emit "c" while Get-BitLockerVolume reports "C:". An
+        // exact == would miss and silently mark the encrypted disk Eligible.
+        let disk = make_disk(false, false);
+        let partition = make_partition(Some('c'));
+        let partitions = vec![&partition];
+        let volume = make_volume("C:", "On");
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Blocked(_)));
+    }
+
+    #[test]
+    fn trailing_separator_mount_point_still_matches_protected_volume() {
+        let disk = make_disk(false, false);
+        let partition = make_partition(Some('C'));
+        let partitions = vec![&partition];
+        let volume = make_volume("C:\\", "On");
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Blocked(_)));
+    }
+
+    #[test]
+    fn nul_drive_letter_is_unknown() {
+        // A partition with no assigned letter serializes from System.Char as
+        // "\u0000" and deserializes to Some('\0'), passing the Option guard.
+        let disk = make_disk(false, false);
+        let partition = make_partition(Some('\0'));
+        let partitions = vec![&partition];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Unknown(_)));
+    }
+
+    #[test]
+    fn letterless_efi_msr_recovery_partitions_do_not_force_unknown() {
+        // EFI System, MSR (Reserved) and WinRE (Recovery) partitions are
+        // legitimately letterless and hold no user data.
+        let disk = make_disk(false, false);
+        let system = make_letterless_partition("System");
+        let reserved = make_letterless_partition("Reserved");
+        let recovery = make_letterless_partition("Recovery");
+        let partitions = vec![&system, &reserved, &recovery];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
         assert!(matches!(result, Eligibility::Eligible));
+    }
+
+    #[test]
+    fn letterless_data_volume_is_unknown() {
+        // A "Basic" partition with no drive letter is a data volume we cannot
+        // correlate to a BitLocker entry: its protection state is unknown.
+        let disk = make_disk(false, false);
+        let partition = make_partition(None);
+        let partitions = vec![&partition];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Unknown(_)));
+    }
+
+    #[test]
+    fn letterless_data_volume_among_system_partitions_is_unknown() {
+        let disk = make_disk(false, false);
+        let system = make_letterless_partition("System");
+        let data = make_partition(None);
+        let partitions = vec![&system, &data];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Unknown(_)));
+    }
+
+    #[test]
+    fn unrecognized_letterless_partition_type_is_unknown() {
+        // Anything not System/Reserved/Recovery is treated as a data volume.
+        let disk = make_disk(false, false);
+        let partition = make_letterless_partition("");
+        let partitions = vec![&partition];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Unknown(_)));
+    }
+
+    #[test]
+    fn lettered_volume_still_evaluated_past_a_letterless_system_partition() {
+        // The letterless-partition skip must not short-circuit evaluation of the
+        // real lettered volumes that follow it.
+        let disk = make_disk(false, false);
+        let system = make_letterless_partition("System");
+        let data = make_partition(Some('D'));
+        let partitions = vec![&system, &data];
+        let volume = make_volume("D:", "On");
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Blocked(_)));
+    }
+
+    #[test]
+    fn bitlocker_failure_with_no_lettered_partitions_is_unknown() {
+        // A failed Get-BitLockerVolume query must not be skipped just because the
+        // disk has no lettered partition to reach the check.
+        let disk = make_disk(false, false);
+        let partition = make_letterless_partition("System");
+        let partitions = vec![&partition];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
+            Err("simulated failure".into());
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Unknown(_)));
+    }
+
+    #[test]
+    fn bitlocker_failure_with_empty_partition_list_is_unknown() {
+        let disk = make_disk(false, false);
+        let partitions: Vec<&Partition> = vec![];
+        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
+            Err("simulated failure".into());
+
+        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+
+        assert!(matches!(result, Eligibility::Unknown(_)));
     }
 
     #[test]
@@ -2441,5 +2674,45 @@ mod tests {
             status_of(&usage, PreflightCheck::CrashDump),
             PreflightStatus::Blocked
         );
+    }
+
+    // --- decode_powershell_stdout / exe_path_to_string -----------------------
+
+    #[test]
+    fn decode_powershell_stdout_rejects_non_utf8() {
+        // A U+FFFD substitution here would become a mangled path that
+        // resolve_path_to_disks attributes to the wrong disk; reject instead.
+        assert!(decode_powershell_stdout(b"C:\\\xff\xfe").is_err());
+    }
+
+    #[test]
+    fn decode_powershell_stdout_trims_valid_output() {
+        assert_eq!(
+            decode_powershell_stdout(b"  []  \r\n").unwrap(),
+            "[]".to_string()
+        );
+    }
+
+    #[test]
+    fn exe_path_to_string_accepts_utf8_path() {
+        let path = std::path::Path::new("C:\\tools\\e-waste.exe");
+        assert_eq!(
+            exe_path_to_string(path).unwrap(),
+            "C:\\tools\\e-waste.exe".to_string()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn exe_path_to_string_rejects_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        // 'A', an unpaired high surrogate, 'B': a valid Windows path with no
+        // UTF-8 form. to_string_lossy would flatten it to "A\u{FFFD}B".
+        let os = OsString::from_wide(&[0x0041, 0xD800, 0x0042]);
+        let path = std::path::PathBuf::from(os);
+
+        assert!(exe_path_to_string(&path).is_err());
     }
 }
