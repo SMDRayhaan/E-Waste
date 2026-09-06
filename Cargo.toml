@@ -2,7 +2,16 @@
 name = "E-Waste"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[lints.rust]
+# Free to adopt today: this crate contains no unsafe. `forbid`, not `deny`, so a
+# local #[allow] cannot re-enable it.
+# revisit when raw disk I/O (M-7) or NVMe Purge FFI (M-11) require unsafe --
+# downgrade to `deny` and pair with unsafe_op_in_unsafe_fn deliberately; do not
+# just delete this line to make a build pass.
+unsafe_code = "forbid"
