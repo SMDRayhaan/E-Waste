@@ -1,3 +1,8 @@
+# Empty table on purpose: it declares this package its own workspace root, so the
+# crate cannot be absorbed into a parent workspace found further up the path. Add
+# `members` here when Module 2/3 actually need sibling crates.
+[workspace]
+
 [package]
 name = "E-Waste"
 version = "0.1.0"
@@ -11,7 +16,8 @@ serde_json = "1"
 [lints.rust]
 # Free to adopt today: this crate contains no unsafe. `forbid`, not `deny`, so a
 # local #[allow] cannot re-enable it.
-# revisit when raw disk I/O (M-7) or NVMe Purge FFI (M-11) require unsafe --
+# revisit at the three milestones that may genuinely need unsafe: M1-7 raw disk
+# I/O, M1-11 NVMe Purge FFI, and Module 3's raw device reading for carving --
 # downgrade to `deny` and pair with unsafe_op_in_unsafe_fn deliberately; do not
 # just delete this line to make a build pass.
 unsafe_code = "forbid"
