@@ -1,3 +1,5 @@
+mod raw_write;
+
 use serde::Deserialize;
 use std::process::{Command, Output};
 
