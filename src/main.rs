@@ -28,6 +28,21 @@ struct PhysicalDisk {
     is_system: bool,
     #[serde(rename = "SizeGB")]
     size_gb: f64,
+    // Raw byte-exact size, distinct from the rounded-to-2-decimals size_gb
+    // above. A future write path must overwrite the disk's real capacity,
+    // not a value reconstructed from a lossy display rounding.
+    #[serde(rename = "Size")]
+    size_bytes: u64,
+    // Absent on virtual/exotic disks, so Option rather than a default that
+    // would read as a real, recognized value.
+    #[serde(rename = "BusType")]
+    bus_type: Option<String>,
+    #[serde(rename = "MediaType")]
+    media_type: Option<String>,
+    // Also null on at least one real disk observed in testing, despite
+    // IsBoot/IsSystem (booleans from the same cmdlet) never being null.
+    #[serde(rename = "IsRemovable")]
+    is_removable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,104 +93,71 @@ fn is_bare_system_partition(partition_type: &str) -> bool {
         || t.eq_ignore_ascii_case("Recovery")
 }
 
+// No Unknown variant: with BitLocker's Unknown-producing checks moved out
+// (see evaluate_bitlocker_protection), the boot/system-disk flag is the only
+// remaining input, and it's always answerable -- there is no longer a case
+// where eligibility itself cannot be determined.
 enum Eligibility {
     Eligible,
     Blocked(String),
-    Unknown(String),
 }
 
-fn evaluate_eligibility(
-    disk: &PhysicalDisk,
-    disk_partitions: &[&Partition],
-    bitlocker: &Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>>,
-) -> Eligibility {
+// BitLocker protection status used to be checked here and could Block/Unknown
+// this result. It no longer does: a physical overwrite destroys ciphertext
+// exactly as well as plaintext, so encryption status is not a wrong-disk or
+// system-destruction risk. It's now method-selection input (crypto-erase vs.
+// physical Purge) reported independently by evaluate_bitlocker_protection(),
+// which cannot veto eligibility. See PLAN.md's architecture-cleanup note.
+fn evaluate_eligibility(disk: &PhysicalDisk) -> Eligibility {
     if is_system_disk(disk) {
         return Eligibility::Blocked("system/boot disk".to_string());
-    }
-
-    // Checked before the loop, not inside it: a failed Get-BitLockerVolume query
-    // is relevant to every disk, so it must not be skipped just because this disk
-    // has no lettered partition to trip the check.
-    let volumes = match bitlocker {
-        Ok(volumes) => volumes,
-        Err(e) => {
-            return Eligibility::Unknown(format!("BitLocker information unavailable: {}", e));
-        }
-    };
-
-    for partition in disk_partitions {
-        let Some(letter) = partition.drive_letter else {
-            // Letterless. EFI/MSR/Recovery partitions are legitimately letterless
-            // and carry no user data — skip them. Anything else letterless is a
-            // data volume we cannot key to a BitLocker entry (correlation is by
-            // drive letter only), so its protection state is unknown, not "safe".
-            if !is_bare_system_partition(&partition.partition_type) {
-                return Eligibility::Unknown(format!(
-                    "disk {} has a letterless {} partition whose BitLocker state cannot be determined",
-                    disk.number, partition.partition_type
-                ));
-            }
-            continue;
-        };
-
-        // A drive letter that is not A-Z cannot name a real volume. Get-Partition
-        // types DriveLetter as System.Char, so a partition with no letter
-        // serializes as "\u0000" and deserializes to Some('\0') rather than None,
-        // slipping past the guard above. Fail closed rather than build a key that
-        // matches nothing.
-        if !letter.is_ascii_alphabetic() {
-            return Eligibility::Unknown(format!(
-                "partition on disk {} reports an unusable drive letter {:?}",
-                disk.number, letter
-            ));
-        }
-
-        // Match case-insensitively and tolerate a trailing separator: Get-Partition
-        // and Get-BitLockerVolume do not agree on the case or exact shape of a
-        // mount point ("c:" vs "C:", "C:" vs "C:\\"). An exact == here turns a
-        // BitLocker-protected volume into a silent Eligible when the strings differ.
-        let mount_point = format!("{}:", letter);
-        let Some(volume) = volumes.iter().find(|v| {
-            v.mount_point
-                .trim_end_matches('\\')
-                .eq_ignore_ascii_case(&mount_point)
-        }) else {
-            // Get-BitLockerVolume lists every fixed volume, protected or not, so a
-            // lettered partition with no entry at all is anomalous: report Unknown
-            // instead of falling through to Eligible.
-            return Eligibility::Unknown(format!(
-                "no BitLocker entry for volume {} on disk {}: protection state unknown",
-                mount_point, disk.number
-            ));
-        };
-
-        match volume.protection_status.as_str() {
-            "On" => {
-                return Eligibility::Blocked(format!(
-                    "volume {} is BitLocker-protected (ProtectionStatus: On)",
-                    mount_point
-                ));
-            }
-            "Off" => continue,
-            other => {
-                return Eligibility::Unknown(format!(
-                    "volume {} has unrecognized ProtectionStatus '{}'",
-                    mount_point, other
-                ));
-            }
-        }
     }
 
     Eligibility::Eligible
 }
 
-// Not yet called from main(): this is the read-only selection primitive for a
-// future target-selection step, exercised by the tests below until it's wired in.
-#[allow(dead_code)]
+// M1-6: gating for the reversible offline/online transition. Deliberately
+// routed through evaluate_eligibility (boot/system-disk check) rather than
+// plan_for_disk's capacity-trust gate -- taking a disk offline writes no
+// data, so it is orthogonal to whether its reported capacity is trusted.
+//
+// No pre-check here for removable media: bus_type/is_removable are not a
+// reliable way to predict Windows' own "Removable media cannot be set to
+// offline" restriction (is_removable is already known to be blank on real
+// hardware here, see PhysicalDisk::is_removable), so this defers to
+// Set-Disk's own authoritative rejection instead of guessing from an
+// unreliable signal.
+enum TransitionEligibility {
+    Eligible,
+    Blocked(String),
+}
+
+fn evaluate_transition_eligibility(
+    disk: &PhysicalDisk,
+    target_offline: bool,
+) -> TransitionEligibility {
+    if let Eligibility::Blocked(reason) = evaluate_eligibility(disk) {
+        return TransitionEligibility::Blocked(reason);
+    }
+
+    let currently_offline = disk.operational_status.eq_ignore_ascii_case("Offline");
+    if target_offline == currently_offline {
+        let state = if currently_offline {
+            "offline"
+        } else {
+            "online"
+        };
+        return TransitionEligibility::Blocked(format!("disk is already {state}"));
+    }
+
+    TransitionEligibility::Eligible
+}
+
+// The read-only selection primitive for M1-5's target-selection step,
+// called from main() with expected_serial: None -- interactive serial
+// confirmation happens afterward, in confirm_and_bind, not at selection.
 fn select_target_disk<'a>(
     disks: &'a [PhysicalDisk],
-    partitions: &[Partition],
-    bitlocker: &Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>>,
     disk_number: u32,
     expected_serial: Option<&str>,
 ) -> Result<&'a PhysicalDisk, String> {
@@ -210,18 +192,9 @@ fn select_target_disk<'a>(
         }
     }
 
-    let disk_partitions: Vec<&Partition> = partitions
-        .iter()
-        .filter(|p| p.disk_number == disk_number)
-        .collect();
-
-    match evaluate_eligibility(disk, &disk_partitions, bitlocker) {
+    match evaluate_eligibility(disk) {
         Eligibility::Eligible => Ok(disk),
         Eligibility::Blocked(reason) => Err(format!("disk {} is blocked: {}", disk_number, reason)),
-        Eligibility::Unknown(reason) => Err(format!(
-            "disk {} eligibility is unknown: {}",
-            disk_number, reason
-        )),
     }
 }
 
@@ -232,12 +205,10 @@ fn select_target_disk<'a>(
 // occupy the same number after a topology change. For that same reason it never
 // searches by serial to "follow" a renumbered disk; auto-recovering from a
 // changed topology right before a destructive operation must fail closed.
-#[allow(dead_code)]
+// Called from confirm_and_bind, immediately before it re-derives the plan.
 fn verify_target_before_operation<'a>(
     original: &PhysicalDisk,
     fresh_disks: &'a [PhysicalDisk],
-    fresh_partitions: &[Partition],
-    fresh_bitlocker: &Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>>,
 ) -> Result<&'a PhysicalDisk, String> {
     let expected_serial = match original.serial_number.as_deref() {
         Some(serial) if !serial.trim().is_empty() => serial,
@@ -300,6 +271,16 @@ fn verify_target_before_operation<'a>(
         ));
     }
 
+    // size_gb is rounded to 2 decimals for display; two genuinely different
+    // raw capacities can round to the same displayed value. size_bytes is
+    // exact and must match too, or a capacity change could slip through.
+    if fresh.size_bytes != original.size_bytes {
+        return Err(format!(
+            "disk {} exact size no longer matches the selected target",
+            original.number
+        ));
+    }
+
     // Redundant with evaluate_eligibility()'s first check, kept deliberately as
     // defence in depth on the most catastrophic failure case.
     if is_system_disk(fresh) {
@@ -309,22 +290,161 @@ fn verify_target_before_operation<'a>(
         ));
     }
 
-    let disk_partitions: Vec<&Partition> = fresh_partitions
-        .iter()
-        .filter(|p| p.disk_number == fresh.number)
-        .collect();
-
-    match evaluate_eligibility(fresh, &disk_partitions, fresh_bitlocker) {
+    match evaluate_eligibility(fresh) {
         Eligibility::Eligible => Ok(fresh),
         Eligibility::Blocked(reason) => Err(format!(
             "disk {} is blocked in the current inventory: {}",
             original.number, reason
         )),
-        Eligibility::Unknown(reason) => Err(format!(
-            "disk {} eligibility is unknown in the current inventory: {}",
-            original.number, reason
-        )),
     }
+}
+
+// --- M1-4: sanitization planner / dry-run ------------------------------------
+//
+// States what a sanitize operation would do to a disk, without doing it. Pure
+// and read-only: reuses evaluate_eligibility() as the sole gate rather than
+// re-deriving it, and never touches raw_write. Method selection (Clear vs.
+// Purge, per-media-type handling) is not decided here -- that is M1-5/M1-9/
+// M1-11; the two constants below are a deliberately generic placeholder so a
+// plan has something concrete to state before that policy exists.
+const PLANNED_PATTERN: u8 = 0x00;
+const PLANNED_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+
+// Bus types whose reported capacity is trusted for planning purposes:
+// internal, directly-attached buses where Windows' own value reliably
+// reflects true device LBA count. Anything else -- including USB/SD/MMC
+// bridge chips, or no bus type reported at all -- fails closed. Confirmed
+// necessary on real hardware (A.1): a USB-SD bridge reported ~2045GB for a
+// physically 32GB card. This is deliberately keyed on bus type, not media
+// type: MediaType can be blank on a perfectly trustworthy internal disk too
+// (observed on this machine's own NVMe SSD), so gating on MediaType alone
+// would incorrectly withhold a plan for hardware with no capacity problem.
+const CAPACITY_TRUSTED_BUS_TYPES: &[&str] = &[
+    "SATA",
+    "NVMe",
+    "SAS",
+    "ATA",
+    "SCSI",
+    "Fibre Channel",
+    "RAID",
+    "iSCSI",
+];
+
+fn is_capacity_trusted_bus(bus_type: Option<&str>) -> bool {
+    matches!(
+        bus_type,
+        Some(b) if CAPACITY_TRUSTED_BUS_TYPES
+            .iter()
+            .any(|known| b.eq_ignore_ascii_case(known))
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DiskPlan {
+    Planned {
+        total_bytes: u64,
+        pattern: u8,
+        chunk_size: usize,
+    },
+    Skipped(String),
+    // No byte count here, deliberately: a disk lands in this state precisely
+    // because its reported capacity is not trusted, so the size we'd
+    // otherwise report cannot be attached to anything plan-shaped. If it's
+    // worth showing at all, main() prints it separately as a labeled
+    // inventory fact, sourced from PhysicalDisk directly.
+    PendingCapacityConfirmation(String),
+}
+
+fn plan_for_disk(disk: &PhysicalDisk) -> DiskPlan {
+    match evaluate_eligibility(disk) {
+        Eligibility::Blocked(reason) => return DiskPlan::Skipped(reason),
+        Eligibility::Eligible => {}
+    }
+
+    if !is_capacity_trusted_bus(disk.bus_type.as_deref()) {
+        return DiskPlan::PendingCapacityConfirmation(format!(
+            "bus type {} is not on the list of buses with trusted capacity reporting",
+            disk.bus_type.as_deref().unwrap_or("(absent)")
+        ));
+    }
+
+    DiskPlan::Planned {
+        total_bytes: disk.size_bytes,
+        pattern: PLANNED_PATTERN,
+        chunk_size: PLANNED_CHUNK_SIZE,
+    }
+}
+
+// --- M1-5: destructive-operation confirmation gate ---------------------------
+//
+// The last check to run before a future executor (M1-6/M1-7, not built yet)
+// would ever be allowed to call raw_write::overwrite. Pure and read-only, like
+// everything else in this file up to here -- confirm_and_bind() decides
+// whether an operation may be bound, it never performs one. The only thing
+// downstream of this milestone that doesn't exist yet is the executor itself.
+
+// The result of a successful confirmation: an identity-verified disk paired
+// with the exact plan the operator was shown. Nothing else in this module
+// constructs one, and it is never re-derived after this point -- a future
+// executor must receive exactly this, not re-fetch or re-plan on its own.
+struct BoundOperation<'a> {
+    disk: &'a PhysicalDisk,
+    plan: DiskPlan,
+}
+
+// Every check here fails closed and refuses rather than guesses. Order
+// matters only for cost: cheap checks (confirmed_plan shape, serial match)
+// run before the more expensive fresh-inventory-dependent ones. Called from
+// main()'s confirmation block after the operator's typed line is read.
+fn confirm_and_bind<'a>(
+    selected: &PhysicalDisk,
+    confirmed_plan: &DiskPlan,
+    entered_serial: &str,
+    fresh_disks: &'a [PhysicalDisk],
+) -> Result<BoundOperation<'a>, String> {
+    // Defence in depth: this function must not trust that its caller only
+    // ever reaches it with a Planned confirmed_plan.
+    if !matches!(confirmed_plan, DiskPlan::Planned { .. }) {
+        return Err("cannot confirm an operation that was not Planned".to_string());
+    }
+
+    let expected_serial = match selected.serial_number.as_deref() {
+        Some(serial) if !serial.trim().is_empty() => serial,
+        _ => {
+            return Err(format!(
+                "disk {} has no usable serial number: cannot be confirmed",
+                selected.number
+            ));
+        }
+    };
+
+    // Exact, case-sensitive match: the operator is asked to type back exactly
+    // what was shown on screen. A blank or whitespace-only line -- including
+    // a cancelled prompt -- can never coincidentally equal a real serial.
+    if entered_serial.trim() != expected_serial {
+        return Err("confirmation did not match the disk's serial number".to_string());
+    }
+
+    let fresh = verify_target_before_operation(selected, fresh_disks)?;
+
+    // The actual gap this milestone closes: identity matching alone (above)
+    // does not guarantee the plan is unchanged -- a disk can keep the same
+    // number, serial, name and size while its bus-type capacity-trust
+    // classification changes. Re-deriving and requiring exact structural
+    // equality (not just "still Planned") catches that. plan_for_disk needs
+    // only the disk itself, not partitions or BitLocker state.
+    let fresh_plan = plan_for_disk(fresh);
+    if fresh_plan != *confirmed_plan {
+        return Err(
+            "the plan for this disk has changed since confirmation -- aborting; re-run to reconfirm"
+                .to_string(),
+        );
+    }
+
+    Ok(BoundOperation {
+        disk: fresh,
+        plan: fresh_plan,
+    })
 }
 
 // --- M-2: extended pre-flight ------------------------------------------------
@@ -362,6 +482,8 @@ enum PreflightCheck {
     CrashDump,
     ShadowCopy,
     ExecutableLocation,
+    MediaDetection,
+    BitLockerProtection,
 }
 
 impl PreflightCheck {
@@ -372,6 +494,8 @@ impl PreflightCheck {
             PreflightCheck::CrashDump => "Crash Dump",
             PreflightCheck::ShadowCopy => "Shadow Copies",
             PreflightCheck::ExecutableLocation => "Executable Location",
+            PreflightCheck::MediaDetection => "Media Detection",
+            PreflightCheck::BitLockerProtection => "BitLocker Protection",
         }
     }
 }
@@ -572,6 +696,14 @@ fn safe_finding(check: PreflightCheck, detail: &str) -> PreflightFinding {
         check,
         status: PreflightStatus::Safe,
         detail: detail.to_string(),
+    }
+}
+
+fn blocked_finding(check: PreflightCheck, detail: String) -> PreflightFinding {
+    PreflightFinding {
+        check,
+        status: PreflightStatus::Blocked,
+        detail,
     }
 }
 
@@ -783,6 +915,156 @@ fn evaluate_executable_location(
     )
 }
 
+// Architecture-cleanup: this used to be evaluate_eligibility()'s partition
+// loop and could Block/Unknown the whole disk. It's now purely informational
+// -- reported alongside Media Detection, not one of evaluate_preflight's fixed
+// checks because it reads BitLockerVolume/Partition data main() already has,
+// not SystemUsage. Same checks, same messages, same order as before; only the
+// authority to veto a plan is gone. Cannot be called before the disk's own
+// partitions have been filtered by the caller, exactly like the eligibility
+// version was.
+fn evaluate_bitlocker_protection(
+    disk: &PhysicalDisk,
+    disk_partitions: &[&Partition],
+    bitlocker: &Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>>,
+) -> PreflightFinding {
+    // Checked before the loop, not inside it: a failed Get-BitLockerVolume query
+    // is relevant to every disk, so it must not be skipped just because this disk
+    // has no lettered partition to trip the check.
+    let volumes = match bitlocker {
+        Ok(volumes) => volumes,
+        Err(e) => {
+            return unknown_finding(
+                PreflightCheck::BitLockerProtection,
+                format!("BitLocker information unavailable: {}", e),
+            );
+        }
+    };
+
+    for partition in disk_partitions {
+        let Some(letter) = partition.drive_letter else {
+            // Letterless. EFI/MSR/Recovery partitions are legitimately letterless
+            // and carry no user data — skip them. Anything else letterless is a
+            // data volume we cannot key to a BitLocker entry (correlation is by
+            // drive letter only), so its protection state is unknown, not "safe".
+            if !is_bare_system_partition(&partition.partition_type) {
+                return unknown_finding(
+                    PreflightCheck::BitLockerProtection,
+                    format!(
+                        "disk {} has a letterless {} partition whose BitLocker state cannot be determined",
+                        disk.number, partition.partition_type
+                    ),
+                );
+            }
+            continue;
+        };
+
+        // A drive letter that is not A-Z cannot name a real volume. Get-Partition
+        // types DriveLetter as System.Char, so a partition with no letter
+        // serializes as "\u0000" and deserializes to Some('\0') rather than None,
+        // slipping past the guard above. Fail closed rather than build a key that
+        // matches nothing.
+        if !letter.is_ascii_alphabetic() {
+            return unknown_finding(
+                PreflightCheck::BitLockerProtection,
+                format!(
+                    "partition on disk {} reports an unusable drive letter {:?}",
+                    disk.number, letter
+                ),
+            );
+        }
+
+        // Match case-insensitively and tolerate a trailing separator: Get-Partition
+        // and Get-BitLockerVolume do not agree on the case or exact shape of a
+        // mount point ("c:" vs "C:", "C:" vs "C:\\"). An exact == here turns a
+        // BitLocker-protected volume into a silent Safe when the strings differ.
+        let mount_point = format!("{}:", letter);
+        let Some(volume) = volumes.iter().find(|v| {
+            v.mount_point
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(&mount_point)
+        }) else {
+            // Get-BitLockerVolume lists every fixed volume, protected or not, so a
+            // lettered partition with no entry at all is anomalous: report Unknown
+            // instead of falling through to Safe.
+            return unknown_finding(
+                PreflightCheck::BitLockerProtection,
+                format!(
+                    "no BitLocker entry for volume {} on disk {}: protection state unknown",
+                    mount_point, disk.number
+                ),
+            );
+        };
+
+        match volume.protection_status.as_str() {
+            "On" => {
+                return blocked_finding(
+                    PreflightCheck::BitLockerProtection,
+                    format!(
+                        "volume {} is BitLocker-protected (ProtectionStatus: On)",
+                        mount_point
+                    ),
+                );
+            }
+            "Off" => continue,
+            other => {
+                return unknown_finding(
+                    PreflightCheck::BitLockerProtection,
+                    format!(
+                        "volume {} has unrecognized ProtectionStatus '{}'",
+                        mount_point, other
+                    ),
+                );
+            }
+        }
+    }
+
+    safe_finding(
+        PreflightCheck::BitLockerProtection,
+        "no partition on this disk is BitLocker-protected",
+    )
+}
+
+// M1-3: media/capability detection. Not one of evaluate_preflight's fixed
+// checks because it reads PhysicalDisk, not SystemUsage -- callers append its
+// finding to a PreflightReport themselves. Fails closed: BusType/MediaType
+// absent, or Windows' own "Unspecified"/"Unknown" sentinels, means we do not
+// actually know what kind of media this is, and later method-selection logic
+// (SSD vs. HDD vs. NVMe handling) must not be allowed to assume otherwise.
+fn is_recognized_media_value(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "Unspecified" && v != "Unknown")
+}
+
+fn evaluate_media_detection(disk: &PhysicalDisk) -> PreflightFinding {
+    let bus_type = disk.bus_type.as_deref();
+    let media_type = disk.media_type.as_deref();
+
+    if is_recognized_media_value(bus_type) && is_recognized_media_value(media_type) {
+        let removable = disk
+            .is_removable
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+        return safe_finding(
+            PreflightCheck::MediaDetection,
+            &format!(
+                "bus type {} / media type {} / removable: {}",
+                bus_type.unwrap(),
+                media_type.unwrap(),
+                removable
+            ),
+        );
+    }
+
+    unknown_finding(
+        PreflightCheck::MediaDetection,
+        format!(
+            "bus type {} / media type {} not fully recognized",
+            bus_type.unwrap_or("(absent)"),
+            media_type.unwrap_or("(absent)")
+        ),
+    )
+}
+
 // Pure: no Windows I/O, so the whole safety decision is unit-testable. Emits
 // exactly one finding per check, in a fixed order, so the combined result is
 // deterministic and no check can be silently omitted from the report.
@@ -859,7 +1141,9 @@ fn is_elevated() -> Result<bool, Box<dyn std::error::Error>> {
 fn get_physical_disks() -> Result<Vec<PhysicalDisk>, Box<dyn std::error::Error>> {
     let output = execute_powershell(
         "$disks = @(Get-Disk | Select-Object Number,FriendlyName,SerialNumber,HealthStatus,\
-OperationalStatus,IsBoot,IsSystem,@{N='SizeGB';E={[math]::Round($_.Size / 1GB, 2)}}); \
+OperationalStatus,IsBoot,IsSystem,@{N='SizeGB';E={[math]::Round($_.Size / 1GB, 2)}},Size,\
+@{N='BusType';E={$_.BusType.ToString()}},@{N='MediaType';E={$_.MediaType.ToString()}},\
+IsRemovable); \
 ConvertTo-Json -InputObject $disks",
     )?;
 
@@ -878,6 +1162,33 @@ ConvertTo-Json -InputObject $disks",
 
     let disks: Vec<PhysicalDisk> = serde_json::from_str(&stdout)?;
     Ok(disks)
+}
+
+// M1-6: reversible offline/online transition. Same error-handling shape as
+// every other PowerShell caller here (non-empty stderr is a failure even on
+// exit 0) -- but note the error text itself is load-bearing for removable
+// media: Set-Disk rejects -IsOffline $true on a removable disk with "Not
+// Supported / Removable media cannot be set to offline", and that message is
+// passed through verbatim rather than being caught or reworded, since it's
+// the OS's own authoritative answer (see evaluate_transition_eligibility).
+fn set_disk_offline(disk_number: u32) -> Result<(), String> {
+    let output = execute_powershell(&format!("Set-Disk -Number {disk_number} -IsOffline $true"))
+        .map_err(|e| e.to_string())?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(format!("PowerShell error: {stderr}"));
+    }
+    Ok(())
+}
+
+fn set_disk_online(disk_number: u32) -> Result<(), String> {
+    let output = execute_powershell(&format!("Set-Disk -Number {disk_number} -IsOffline $false"))
+        .map_err(|e| e.to_string())?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(format!("PowerShell error: {stderr}"));
+    }
+    Ok(())
 }
 
 fn get_partitions() -> Result<Vec<Partition>, Box<dyn std::error::Error>> {
@@ -1071,7 +1382,193 @@ fn collect_system_usage() -> SystemUsage {
     }
 }
 
+// Pure: takes the raw arg vector (argv[0] included -- it never matches the
+// flag, so no special-casing is needed) so it's testable without touching
+// std::env. Absent flag is not an error: the default, argument-free
+// behavior (report everything, target nothing) must remain unchanged.
+fn parse_disk_number_arg(args: &[String], flag: &str) -> Result<Option<u32>, String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            let value = iter
+                .next()
+                .ok_or_else(|| format!("{flag} requires a disk number"))?;
+            let number: u32 = value
+                .parse()
+                .map_err(|_| format!("{flag} value {:?} is not a valid disk number", value))?;
+            return Ok(Some(number));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_target_disk_arg(args: &[String]) -> Result<Option<u32>, String> {
+    parse_disk_number_arg(args, "--target-disk")
+}
+
+fn parse_offline_disk_arg(args: &[String]) -> Result<Option<u32>, String> {
+    parse_disk_number_arg(args, "--offline-disk")
+}
+
+fn parse_online_disk_arg(args: &[String]) -> Result<Option<u32>, String> {
+    parse_disk_number_arg(args, "--online-disk")
+}
+
+fn require_disk_inventory(
+    disks_result: &Result<Vec<PhysicalDisk>, Box<dyn std::error::Error>>,
+    disk_number: u32,
+) -> &[PhysicalDisk] {
+    match disks_result {
+        Ok(disks) => disks,
+        Err(e) => {
+            eprintln!(
+                "Cannot target disk {}: disk information unavailable: {}",
+                disk_number, e
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn read_stdin_line() -> String {
+    print!("> ");
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    let mut entered = String::new();
+    // A read error (e.g. invalid UTF-8) can never match a real confirmation
+    // value, so it is left as an empty line and handled by the same path as
+    // a wrong or cancelled entry -- no special-casing needed.
+    let _ = std::io::stdin().read_line(&mut entered);
+    entered
+}
+
+// M1-6: shared flow for --offline-disk/--online-disk. Confirmation is a
+// plain "YES" rather than M1-5's serial-retype flow -- this writes no data
+// and is reversible (modulo the still-open drive-letter-restoration
+// question noted in PLAN.md), so it doesn't warrant that much friction.
+fn run_disk_transition(disk_number: u32, target_offline: bool, disks: &[PhysicalDisk]) {
+    let verb = if target_offline { "offline" } else { "online" };
+    println!(
+        "=== Disk {} Transition ===",
+        if target_offline { "Offline" } else { "Online" }
+    );
+
+    let selected = match select_target_disk(disks, disk_number, None) {
+        Ok(selected) => selected,
+        Err(e) => {
+            eprintln!("Cannot target disk {}: {}", disk_number, e);
+            std::process::exit(2);
+        }
+    };
+
+    if let TransitionEligibility::Blocked(reason) =
+        evaluate_transition_eligibility(selected, target_offline)
+    {
+        eprintln!("Cannot transition disk {}: {}", disk_number, reason);
+        std::process::exit(2);
+    }
+
+    println!();
+    println!("You have selected:");
+    println!("  Disk number:      {}", selected.number);
+    println!("  Friendly name:    {}", selected.friendly_name);
+    println!("  Current state:    {}", selected.operational_status);
+    println!("  Requested action: take this disk {}", verb);
+    println!();
+    println!("This is a reversible state change -- no data is written by this");
+    println!("operation. Windows may reject it for reasons unrelated to this tool");
+    println!("(for example, removable media cannot be taken offline).");
+    println!();
+    println!("Type YES and press Enter to proceed. Anything else cancels.");
+    println!();
+
+    let entered = read_stdin_line();
+    if entered.trim() != "YES" {
+        eprintln!("Confirmation failed: input did not match \"YES\".");
+        eprintln!("No data has been modified. Re-run the tool to try again.");
+        std::process::exit(2);
+    }
+
+    let result = if target_offline {
+        set_disk_offline(disk_number)
+    } else {
+        set_disk_online(disk_number)
+    };
+    if let Err(e) = result {
+        eprintln!("Transition failed: {}", e);
+        eprintln!("No further action was taken.");
+        std::process::exit(2);
+    }
+
+    println!();
+    println!("Transition command completed. Re-checking inventory...");
+    match get_physical_disks() {
+        Ok(fresh_disks) => match fresh_disks.iter().find(|d| d.number == disk_number) {
+            Some(fresh) => {
+                println!("  Disk number:   {}", fresh.number);
+                println!("  Friendly name: {}", fresh.friendly_name);
+                println!(
+                    "  Serial number: {}",
+                    fresh.serial_number.as_deref().unwrap_or("(none)")
+                );
+                println!("  Operational:   {}", fresh.operational_status);
+            }
+            None => {
+                println!(
+                    "  Disk {} no longer appears in inventory after the transition.",
+                    disk_number
+                );
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "Transition command completed, but re-inventory failed: {}",
+                e
+            );
+        }
+    }
+}
+
 fn main() {
+    // Parsed before elevation/enumeration: a malformed disk-number value is a
+    // pure input error, unrelated to disk access, and should fail fast.
+    let args: Vec<String> = std::env::args().collect();
+    let target_disk = match parse_target_disk_arg(&args) {
+        Ok(target_disk) => target_disk,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    let offline_disk = match parse_offline_disk_arg(&args) {
+        Ok(offline_disk) => offline_disk,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    let online_disk = match parse_online_disk_arg(&args) {
+        Ok(online_disk) => online_disk,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    if [
+        target_disk.is_some(),
+        offline_disk.is_some(),
+        online_disk.is_some(),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count()
+        > 1
+    {
+        eprintln!("Only one of --target-disk, --offline-disk, --online-disk may be given.");
+        std::process::exit(2);
+    }
+
     // Administrator privileges are a prerequisite: the disk and BitLocker
     // inventory below needs an elevated token, and later milestones will perform
     // operations that must never run unprivileged. Refuse before touching any
@@ -1125,6 +1622,20 @@ fn main() {
                     if is_system_disk(disk) { "YES" } else { "NO" }
                 );
                 println!("  Size: {:.2} GB", disk.size_gb);
+                println!(
+                    "  Bus Type: {}",
+                    disk.bus_type.as_deref().unwrap_or("Unavailable")
+                );
+                println!(
+                    "  Media Type: {}",
+                    disk.media_type.as_deref().unwrap_or("Unavailable")
+                );
+                println!(
+                    "  Removable: {}",
+                    disk.is_removable
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "Unavailable".to_string())
+                );
             }
         }
         Err(e) => {
@@ -1224,38 +1735,25 @@ fn main() {
         (_, Err(e)) => eprintln!("Error getting partition information: {}", e),
     }
 
+    // M1-1: only the boot/system-disk check now -- BitLocker protection moved
+    // to the Extended Pre-Flight section below (see evaluate_bitlocker_protection),
+    // since it's method-selection evidence, not a wrong-disk/system-destruction
+    // risk a physical overwrite needs to guard against.
     println!("=== Disk Eligibility ===");
-    match (&disks_result, &partitions_result) {
-        (Ok(disks), Ok(partitions)) => {
-            if disks.is_empty() {
-                println!("No physical disks found.");
-            }
-
+    match &disks_result {
+        Ok(disks) if disks.is_empty() => {
+            println!("No physical disks found.");
+        }
+        Ok(disks) => {
             for disk in disks {
-                let disk_partitions: Vec<&Partition> = partitions
-                    .iter()
-                    .filter(|p| p.disk_number == disk.number)
-                    .collect();
-
-                let eligibility = evaluate_eligibility(disk, &disk_partitions, &bitlocker_result);
-
                 print!("Disk {}: ", disk.number);
-                match eligibility {
+                match evaluate_eligibility(disk) {
                     Eligibility::Eligible => println!("ELIGIBLE"),
                     Eligibility::Blocked(reason) => println!("BLOCKED: {}", reason),
-                    Eligibility::Unknown(reason) => println!("UNKNOWN: {}", reason),
                 }
             }
         }
-        (Ok(disks), Err(e)) => {
-            for disk in disks {
-                println!(
-                    "Disk {}: UNKNOWN: partition information unavailable: {}",
-                    disk.number, e
-                );
-            }
-        }
-        (Err(e), _) => eprintln!("Error getting disk information: {}", e),
+        Err(e) => eprintln!("Error getting disk information: {}", e),
     }
 
     // M-2: read-only usage detection. Reports only -- no disk, volume, service,
@@ -1275,7 +1773,18 @@ fn main() {
             for disk in disks {
                 println!("Disk {}", disk.number);
 
-                let report = evaluate_preflight(disk.number, partitions, &usage);
+                let disk_partitions: Vec<&Partition> = partitions
+                    .iter()
+                    .filter(|p| p.disk_number == disk.number)
+                    .collect();
+
+                let mut report = evaluate_preflight(disk.number, partitions, &usage);
+                report.findings.push(evaluate_media_detection(disk));
+                report.findings.push(evaluate_bitlocker_protection(
+                    disk,
+                    &disk_partitions,
+                    &bitlocker_result,
+                ));
                 for finding in &report.findings {
                     println!(
                         "  {:<21}{:<9}{}",
@@ -1298,6 +1807,181 @@ be correlated to a physical disk: {}",
         }
         (Err(e), _) => eprintln!("Error getting disk information: {}", e),
     }
+
+    // M1-4: states what a sanitize operation would do -- nothing here writes,
+    // and nothing here is wired to raw_write. Method selection (Clear vs.
+    // Purge) is not decided here; see PLANNED_PATTERN/PLANNED_CHUNK_SIZE.
+    println!("=== Sanitization Plan (dry-run -- nothing executed) ===");
+    match &disks_result {
+        Ok(disks) if disks.is_empty() => {
+            println!("No physical disks found.");
+        }
+        Ok(disks) => {
+            for disk in disks {
+                print!("Disk {}: ", disk.number);
+                match plan_for_disk(disk) {
+                    DiskPlan::Planned {
+                        total_bytes,
+                        pattern,
+                        chunk_size,
+                    } => println!(
+                        "PLANNED  overwrite {} bytes, pattern {:#04x}, chunk size {} bytes",
+                        total_bytes, pattern, chunk_size
+                    ),
+                    DiskPlan::Skipped(reason) => println!("SKIPPED  {}", reason),
+                    DiskPlan::PendingCapacityConfirmation(reason) => {
+                        println!(
+                            "PENDING  capacity not trusted: {} -- not planned until resolved",
+                            reason
+                        );
+                        println!(
+                            "  (inventory only, capacity trust unresolved: Get-Disk reports {} bytes exact)",
+                            disk.size_bytes
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("Error getting disk information: {}", e),
+    }
+
+    // M1-5: the confirmation gate. Opt-in only -- everything above runs
+    // unconditionally regardless of --target-disk, so the operator always
+    // sees full context before any prompt, and the argument-free default
+    // behavior above is unchanged. Refuses before ever printing a prompt if
+    // the disk isn't Planned or has no serial; nothing here calls
+    // raw_write::overwrite -- confirm_and_bind only decides whether an
+    // operation may be bound.
+    if let Some(disk_number) = offline_disk {
+        let disks = require_disk_inventory(&disks_result, disk_number);
+        run_disk_transition(disk_number, true, disks);
+        return;
+    }
+
+    if let Some(disk_number) = online_disk {
+        let disks = require_disk_inventory(&disks_result, disk_number);
+        run_disk_transition(disk_number, false, disks);
+        return;
+    }
+
+    let Some(disk_number) = target_disk else {
+        return;
+    };
+
+    println!("=== Destructive Operation Confirmation ===");
+
+    let disks = require_disk_inventory(&disks_result, disk_number);
+
+    let selected = match select_target_disk(disks, disk_number, None) {
+        Ok(selected) => selected,
+        Err(e) => {
+            eprintln!("Cannot target disk {}: {}", disk_number, e);
+            std::process::exit(2);
+        }
+    };
+
+    let confirmed_plan = plan_for_disk(selected);
+    let (pattern, chunk_size) = match &confirmed_plan {
+        DiskPlan::Planned {
+            pattern,
+            chunk_size,
+            ..
+        } => (*pattern, *chunk_size),
+        DiskPlan::Skipped(reason) => {
+            eprintln!("Cannot target disk {}: {}", disk_number, reason);
+            std::process::exit(2);
+        }
+        DiskPlan::PendingCapacityConfirmation(reason) => {
+            eprintln!(
+                "Cannot target disk {}: capacity not trusted: {}",
+                disk_number, reason
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let Some(serial) = selected
+        .serial_number
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        eprintln!(
+            "Disk {} has no usable serial number and cannot be confirmed.",
+            disk_number
+        );
+        std::process::exit(2);
+    };
+
+    println!();
+    println!("You have selected:");
+    println!("  Disk number:   {}", selected.number);
+    println!("  Friendly name: {}", selected.friendly_name);
+    println!("  Serial number: {}", serial);
+    println!(
+        "  Reported size: {:.2} GB ({} bytes exact, per Get-Disk)",
+        selected.size_gb, selected.size_bytes
+    );
+    println!("  Planned action: overwrite the ENTIRE disk with a fixed byte pattern");
+    println!(
+        "                  ({:#04x}), in {}-byte chunks",
+        pattern, chunk_size
+    );
+    println!();
+    println!("This operation is DESTRUCTIVE and IRREVERSIBLE. All data on this disk");
+    println!("will be overwritten and will not be recoverable by this tool, or any");
+    println!("other software, once the operation completes.");
+    println!();
+    println!("This confirmation records operator intent only. It does not prove no");
+    println!("other process holds this disk open, and it does not certify a NIST");
+    println!("SP 800-88 sanitization category -- that determination belongs to a");
+    println!("later, unimplemented step.");
+    println!();
+    println!("To proceed, type this disk's exact serial number and press Enter.");
+    println!("Anything else -- including a blank line, or Ctrl+C -- cancels. Nothing");
+    println!("has been written to any disk yet.");
+    println!();
+    let entered = read_stdin_line();
+
+    let fresh_disks = match get_physical_disks() {
+        Ok(fresh_disks) => fresh_disks,
+        Err(e) => {
+            eprintln!(
+                "Could not re-verify target: fresh inventory unavailable: {}",
+                e
+            );
+            std::process::exit(2);
+        }
+    };
+
+    match confirm_and_bind(selected, &confirmed_plan, &entered, &fresh_disks) {
+        Ok(bound) => {
+            // confirm_and_bind guarantees bound.plan is Planned -- it refuses
+            // to construct a BoundOperation otherwise.
+            let DiskPlan::Planned {
+                total_bytes,
+                pattern,
+                ..
+            } = bound.plan
+            else {
+                unreachable!("confirm_and_bind only binds a Planned plan");
+            };
+            println!(
+                "Confirmed and bound: disk {} (serial {}), {} bytes, pattern {:#04x}.",
+                bound.disk.number,
+                bound.disk.serial_number.as_deref().unwrap_or(""),
+                total_bytes,
+                pattern
+            );
+            println!(
+                "No sanitization executor exists in this build -- nothing further will happen."
+            );
+        }
+        Err(reason) => {
+            eprintln!("Confirmation failed: {}", reason);
+            eprintln!("No data has been modified. Re-run the tool to try again.");
+            std::process::exit(2);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1314,6 +1998,10 @@ mod tests {
             is_boot,
             is_system,
             size_gb: 100.0,
+            size_bytes: 100 * 1024 * 1024 * 1024,
+            bus_type: Some("SATA".to_string()),
+            media_type: Some("HDD".to_string()),
+            is_removable: Some(false),
         }
     }
 
@@ -1327,6 +2015,10 @@ mod tests {
             is_boot,
             is_system,
             size_gb: 100.0,
+            size_bytes: 100 * 1024 * 1024 * 1024,
+            bus_type: Some("SATA".to_string()),
+            media_type: Some("HDD".to_string()),
+            is_removable: Some(false),
         }
     }
 
@@ -1348,6 +2040,10 @@ mod tests {
             is_boot,
             is_system,
             size_gb,
+            size_bytes: (size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            bus_type: Some("SATA".to_string()),
+            media_type: Some("HDD".to_string()),
+            is_removable: Some(false),
         }
     }
 
@@ -1362,6 +2058,54 @@ mod tests {
             false,
             false,
         )
+    }
+
+    #[test]
+    fn evaluate_transition_eligibility_blocks_system_disk() {
+        let disk = make_disk(true, false);
+        assert!(matches!(
+            evaluate_transition_eligibility(&disk, true),
+            TransitionEligibility::Blocked(_)
+        ));
+        assert!(matches!(
+            evaluate_transition_eligibility(&disk, false),
+            TransitionEligibility::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_transition_eligibility_blocks_when_already_offline() {
+        let mut disk = make_disk(false, false);
+        disk.operational_status = "Offline".to_string();
+        assert!(matches!(
+            evaluate_transition_eligibility(&disk, true),
+            TransitionEligibility::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_transition_eligibility_blocks_when_already_online() {
+        let disk = make_disk(false, false); // operational_status: "Online"
+        assert!(matches!(
+            evaluate_transition_eligibility(&disk, false),
+            TransitionEligibility::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_transition_eligibility_allows_valid_transition() {
+        let mut offline_disk = make_disk(false, false);
+        offline_disk.operational_status = "Offline".to_string();
+        assert!(matches!(
+            evaluate_transition_eligibility(&offline_disk, false),
+            TransitionEligibility::Eligible
+        ));
+
+        let online_disk = make_disk(false, false); // operational_status: "Online"
+        assert!(matches!(
+            evaluate_transition_eligibility(&online_disk, true),
+            TransitionEligibility::Eligible
+        ));
     }
 
     fn make_partition(drive_letter: Option<char>) -> Partition {
@@ -1421,13 +2165,26 @@ mod tests {
     #[test]
     fn system_disk_is_blocked() {
         let disk = make_disk(true, false);
-        let partitions: Vec<&Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_eligibility(&disk);
 
         assert!(matches!(result, Eligibility::Blocked(_)));
     }
+
+    #[test]
+    fn system_disk_via_is_system_flag_alone_is_blocked() {
+        let disk = make_disk(false, true);
+
+        let result = evaluate_eligibility(&disk);
+
+        assert!(matches!(result, Eligibility::Blocked(_)));
+    }
+
+    // The tests below exercised evaluate_eligibility()'s BitLocker handling
+    // before the architecture cleanup that moved it to
+    // evaluate_bitlocker_protection() -- same checks, same messages, same
+    // order, now informational (PreflightFinding) rather than able to veto
+    // Eligibility.
 
     #[test]
     fn active_bitlocker_protection_is_blocked() {
@@ -1437,9 +2194,9 @@ mod tests {
         let volume = make_volume("C:", "On");
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Blocked(_)));
+        assert_eq!(result.status, PreflightStatus::Blocked);
     }
 
     #[test]
@@ -1450,9 +2207,9 @@ mod tests {
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
             Err("simulated failure".into());
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1463,9 +2220,9 @@ mod tests {
         let volume = make_volume("C:", "Unknown");
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1476,20 +2233,11 @@ mod tests {
         let volume = make_volume("C:", "Off");
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
-
-        assert!(matches!(result, Eligibility::Eligible));
-    }
-
-    #[test]
-    fn system_disk_via_is_system_flag_alone_is_blocked() {
-        let disk = make_disk(false, true);
-        let partitions: Vec<&Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
-
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
-
-        assert!(matches!(result, Eligibility::Blocked(_)));
+        assert!(matches!(evaluate_eligibility(&disk), Eligibility::Eligible));
+        assert_eq!(
+            evaluate_bitlocker_protection(&disk, &partitions, &bitlocker).status,
+            PreflightStatus::Safe
+        );
     }
 
     #[test]
@@ -1503,39 +2251,39 @@ mod tests {
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
             Ok(vec![volume_c, volume_d]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Blocked(_)));
+        assert_eq!(result.status, PreflightStatus::Blocked);
     }
 
     #[test]
     fn lettered_partition_with_no_bitlocker_entry_is_unknown() {
         // Get-BitLockerVolume lists every fixed volume, so a lettered partition
         // with no entry at all is anomalous: fail closed, do not fall through to
-        // Eligible.
+        // Safe.
         let disk = make_disk(false, false);
         let partition = make_partition(Some('C'));
         let partitions = vec![&partition];
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
     fn lowercase_drive_letter_still_matches_protected_volume() {
         // Get-Partition may emit "c" while Get-BitLockerVolume reports "C:". An
-        // exact == would miss and silently mark the encrypted disk Eligible.
+        // exact == would miss and silently mark the encrypted disk Safe.
         let disk = make_disk(false, false);
         let partition = make_partition(Some('c'));
         let partitions = vec![&partition];
         let volume = make_volume("C:", "On");
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Blocked(_)));
+        assert_eq!(result.status, PreflightStatus::Blocked);
     }
 
     #[test]
@@ -1546,9 +2294,9 @@ mod tests {
         let volume = make_volume("C:\\", "On");
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Blocked(_)));
+        assert_eq!(result.status, PreflightStatus::Blocked);
     }
 
     #[test]
@@ -1560,9 +2308,9 @@ mod tests {
         let partitions = vec![&partition];
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1576,9 +2324,9 @@ mod tests {
         let partitions = vec![&system, &reserved, &recovery];
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Eligible));
+        assert_eq!(result.status, PreflightStatus::Safe);
     }
 
     #[test]
@@ -1590,9 +2338,9 @@ mod tests {
         let partitions = vec![&partition];
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1603,9 +2351,9 @@ mod tests {
         let partitions = vec![&system, &data];
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1616,9 +2364,9 @@ mod tests {
         let partitions = vec![&partition];
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1632,9 +2380,9 @@ mod tests {
         let volume = make_volume("D:", "On");
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Blocked(_)));
+        assert_eq!(result.status, PreflightStatus::Blocked);
     }
 
     #[test]
@@ -1647,9 +2395,9 @@ mod tests {
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
             Err("simulated failure".into());
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
@@ -1659,18 +2407,16 @@ mod tests {
         let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
             Err("simulated failure".into());
 
-        let result = evaluate_eligibility(&disk, &partitions, &bitlocker);
+        let result = evaluate_bitlocker_protection(&disk, &partitions, &bitlocker);
 
-        assert!(matches!(result, Eligibility::Unknown(_)));
+        assert_eq!(result.status, PreflightStatus::Unknown);
     }
 
     #[test]
     fn select_nonexistent_disk_returns_err() {
         let disks = vec![make_disk(false, false)];
-        let partitions: Vec<Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 99, None);
+        let result = select_target_disk(&disks, 99, None);
 
         assert!(result.is_err());
     }
@@ -1678,46 +2424,31 @@ mod tests {
     #[test]
     fn select_system_disk_returns_err() {
         let disks = vec![make_disk(true, false)];
-        let partitions: Vec<Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, None);
+        let result = select_target_disk(&disks, 0, None);
 
         assert!(result.is_err());
     }
 
     #[test]
-    fn select_disk_with_active_bitlocker_returns_err() {
+    fn select_disk_with_active_bitlocker_returns_ok() {
+        // Architecture cleanup: BitLocker protection no longer gates
+        // selection -- a physical overwrite destroys ciphertext exactly as
+        // well as plaintext, so it's method-selection evidence (reported via
+        // evaluate_bitlocker_protection), not a wrong-disk/system-destruction
+        // risk select_target_disk needs to guard against.
         let disks = vec![make_disk(false, false)];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "On");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, None);
+        let result = select_target_disk(&disks, 0, None);
 
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn select_disk_with_unavailable_bitlocker_returns_err() {
-        let disks = vec![make_disk(false, false)];
-        let partitions = vec![make_partition(Some('C'))];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
-            Err("simulated failure".into());
-
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, None);
-
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
     fn select_eligible_disk_without_serial_returns_ok() {
         let disks = vec![make_disk(false, false)];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, None);
+        let result = select_target_disk(&disks, 0, None);
 
         assert!(result.is_ok());
     }
@@ -1725,11 +2456,8 @@ mod tests {
     #[test]
     fn select_eligible_disk_with_correct_serial_returns_ok() {
         let disks = vec![make_disk_with_serial(false, false, Some("ABC123"))];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, Some("ABC123"));
+        let result = select_target_disk(&disks, 0, Some("ABC123"));
 
         assert!(result.is_ok());
     }
@@ -1737,11 +2465,8 @@ mod tests {
     #[test]
     fn select_eligible_disk_with_incorrect_serial_returns_err() {
         let disks = vec![make_disk_with_serial(false, false, Some("ABC123"))];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, Some("WRONG"));
+        let result = select_target_disk(&disks, 0, Some("WRONG"));
 
         assert!(result.is_err());
     }
@@ -1749,11 +2474,8 @@ mod tests {
     #[test]
     fn select_disk_requiring_serial_but_unavailable_returns_err() {
         let disks = vec![make_disk_with_serial(false, false, None)];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, Some("ABC123"));
+        let result = select_target_disk(&disks, 0, Some("ABC123"));
 
         assert!(result.is_err());
     }
@@ -1761,10 +2483,8 @@ mod tests {
     #[test]
     fn select_disk_with_duplicate_numbers_returns_err() {
         let disks = vec![make_disk(false, false), make_disk(false, false)];
-        let partitions: Vec<Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result = select_target_disk(&disks, &partitions, &bitlocker, 0, None);
+        let result = select_target_disk(&disks, 0, None);
 
         assert!(result.is_err());
     }
@@ -1773,12 +2493,8 @@ mod tests {
     fn verify_refuses_original_without_serial() {
         let original = make_disk_full(0, None, "Test Disk", 100.0, "Healthy", false, false);
         let fresh_disks = vec![make_target_disk()];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1795,12 +2511,8 @@ mod tests {
             false,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1809,11 +2521,8 @@ mod tests {
     fn verify_refuses_when_disk_is_gone() {
         let original = make_target_disk();
         let fresh_disks: Vec<PhysicalDisk> = vec![];
-        let partitions: Vec<Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1822,11 +2531,8 @@ mod tests {
     fn verify_refuses_duplicate_disk_numbers() {
         let original = make_target_disk();
         let fresh_disks = vec![make_target_disk(), make_target_disk()];
-        let partitions: Vec<Partition> = vec![];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1843,12 +2549,8 @@ mod tests {
             false,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1865,12 +2567,8 @@ mod tests {
             false,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1887,12 +2585,8 @@ mod tests {
             false,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1909,12 +2603,8 @@ mod tests {
             false,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
@@ -1931,42 +2621,22 @@ mod tests {
             true,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         assert!(result.is_err());
     }
 
     #[test]
-    fn verify_refuses_when_volume_is_now_protected() {
+    fn verify_accepts_when_volume_is_now_protected() {
+        // Architecture cleanup: BitLocker protection no longer gates
+        // verification either -- see select_disk_with_active_bitlocker_returns_ok.
         let original = make_target_disk();
         let fresh_disks = vec![make_target_disk()];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "On");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn verify_refuses_when_bitlocker_is_unavailable() {
-        let original = make_target_disk();
-        let fresh_disks = vec![make_target_disk()];
-        let partitions = vec![make_partition(Some('C'))];
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> =
-            Err("simulated failure".into());
-
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
-
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1983,16 +2653,184 @@ mod tests {
             false,
             false,
         )];
-        let partitions = vec![make_partition(Some('C'))];
-        let volume = make_volume("C:", "Off");
-        let bitlocker: Result<Vec<BitLockerVolume>, Box<dyn std::error::Error>> = Ok(vec![volume]);
 
-        let result =
-            verify_target_before_operation(&original, &fresh_disks, &partitions, &bitlocker);
+        let result = verify_target_before_operation(&original, &fresh_disks);
 
         let verified = result.expect("matching disk should verify");
         assert_eq!(verified.health_status, "Warning");
         assert!(std::ptr::eq(verified, &fresh_disks[0]));
+    }
+
+    // --- M1-5: destructive-operation confirmation gate ----------------------
+
+    #[test]
+    fn confirm_and_bind_succeeds_when_everything_matches() {
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks = vec![make_target_disk()];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "ABC123", &fresh_disks);
+
+        let bound = result.expect("matching confirmation should bind");
+        assert_eq!(bound.plan, confirmed_plan);
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_wrong_serial() {
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks = vec![make_target_disk()];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "WRONG", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_empty_confirmation() {
+        // Also covers an operator cancelling the prompt: a blank line can
+        // never coincidentally equal a real serial.
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks = vec![make_target_disk()];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "   ", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_a_disk_with_no_serial() {
+        let selected = make_disk(false, false);
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks = vec![make_disk(false, false)];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "anything", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_when_disk_is_gone() {
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks: Vec<PhysicalDisk> = vec![];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "ABC123", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_when_disk_is_now_system_disk() {
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks = vec![make_disk_full(
+            0,
+            Some("ABC123"),
+            "Test Disk",
+            100.0,
+            "Healthy",
+            true,
+            false,
+        )];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "ABC123", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_duplicate_disk_numbers_in_fresh_inventory() {
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        let fresh_disks = vec![make_target_disk(), make_target_disk()];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "ABC123", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_when_bus_type_reclassified() {
+        // The scenario this milestone exists to close: identity fields
+        // (number, serial, name, size) are all unchanged, so
+        // verify_target_before_operation alone would accept this. Only the
+        // plan-equality re-check catches the capacity-trust reclassification.
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+        assert!(matches!(confirmed_plan, DiskPlan::Planned { .. }));
+
+        let mut fresh = make_target_disk();
+        fresh.bus_type = Some("USB".to_string());
+        let fresh_disks = vec![fresh];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "ABC123", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_rejects_when_size_bytes_differs_but_size_gb_does_not() {
+        // Proves the verify_target_before_operation precision fix is wired
+        // in: size_gb is rounded to 2 decimals and can't distinguish this.
+        let selected = make_target_disk();
+        let confirmed_plan = plan_for_disk(&selected);
+
+        let mut fresh = make_target_disk();
+        fresh.size_bytes += 1;
+        let fresh_disks = vec![fresh];
+
+        let result = confirm_and_bind(&selected, &confirmed_plan, "ABC123", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirm_and_bind_requires_a_planned_confirmed_plan() {
+        let selected = make_target_disk();
+        let not_planned = DiskPlan::Skipped("test".to_string());
+        let fresh_disks = vec![make_target_disk()];
+
+        let result = confirm_and_bind(&selected, &not_planned, "ABC123", &fresh_disks);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_target_disk_arg_returns_none_when_absent() {
+        let args = vec!["E-Waste.exe".to_string()];
+
+        assert_eq!(parse_target_disk_arg(&args), Ok(None));
+    }
+
+    #[test]
+    fn parse_target_disk_arg_parses_a_valid_number() {
+        let args = vec![
+            "E-Waste.exe".to_string(),
+            "--target-disk".to_string(),
+            "1".to_string(),
+        ];
+
+        assert_eq!(parse_target_disk_arg(&args), Ok(Some(1)));
+    }
+
+    #[test]
+    fn parse_target_disk_arg_errors_when_value_is_missing() {
+        let args = vec!["E-Waste.exe".to_string(), "--target-disk".to_string()];
+
+        assert!(parse_target_disk_arg(&args).is_err());
+    }
+
+    #[test]
+    fn parse_target_disk_arg_errors_when_value_is_not_a_number() {
+        let args = vec![
+            "E-Waste.exe".to_string(),
+            "--target-disk".to_string(),
+            "abc".to_string(),
+        ];
+
+        assert!(parse_target_disk_arg(&args).is_err());
     }
 
     // --- M-2: extended pre-flight -------------------------------------------
@@ -2494,6 +3332,172 @@ mod tests {
         };
 
         assert_eq!(report.status(), PreflightStatus::Unknown);
+    }
+
+    #[test]
+    fn physical_disk_deserializes_when_is_removable_is_null() {
+        // Real-world Get-Disk output on this machine: IsRemovable came back
+        // null for at least one disk, despite IsBoot/IsSystem never doing so.
+        let json = r#"{
+            "Number": 1,
+            "FriendlyName": "USB2.0 CARD-READER",
+            "SerialNumber": "8120120400400000",
+            "HealthStatus": "Healthy",
+            "OperationalStatus": "Online",
+            "IsBoot": false,
+            "IsSystem": false,
+            "SizeGB": 2045.49,
+            "Size": 2196328163574,
+            "BusType": "USB",
+            "MediaType": "Unspecified",
+            "IsRemovable": null
+        }"#;
+
+        let disk: PhysicalDisk = serde_json::from_str(json).unwrap();
+
+        assert_eq!(disk.is_removable, None);
+    }
+
+    #[test]
+    fn media_detection_safe_when_bus_and_media_type_recognized() {
+        let mut disk = make_disk(false, false);
+        disk.bus_type = Some("USB".to_string());
+        disk.media_type = Some("SSD".to_string());
+        disk.is_removable = Some(true);
+
+        let finding = evaluate_media_detection(&disk);
+
+        assert_eq!(finding.status, PreflightStatus::Safe);
+    }
+
+    #[test]
+    fn media_detection_unknown_when_bus_type_absent() {
+        let mut disk = make_disk(false, false);
+        disk.bus_type = None;
+
+        assert_eq!(
+            evaluate_media_detection(&disk).status,
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn media_detection_unknown_when_media_type_is_windows_sentinel() {
+        let mut disk = make_disk(false, false);
+        disk.media_type = Some("Unspecified".to_string());
+
+        assert_eq!(
+            evaluate_media_detection(&disk).status,
+            PreflightStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn media_detection_participates_in_report_status_combination() {
+        let mut disk = make_disk(false, false);
+        disk.bus_type = None;
+
+        // Every other check is Safe; only media detection is Unknown, so the
+        // combined report must still surface Unknown rather than the Safe
+        // that max() would give if this finding were dropped.
+        let mut report = evaluate_preflight(TARGET, &preflight_partitions(), &safe_usage());
+        report.findings.push(evaluate_media_detection(&disk));
+
+        assert_eq!(report.status(), PreflightStatus::Unknown);
+    }
+
+    #[test]
+    fn physical_disk_deserializes_raw_size_into_size_bytes() {
+        let json = r#"{
+            "Number": 0,
+            "FriendlyName": "Test Disk",
+            "SerialNumber": null,
+            "HealthStatus": "Healthy",
+            "OperationalStatus": "Online",
+            "IsBoot": false,
+            "IsSystem": false,
+            "SizeGB": 0.5,
+            "Size": 536870912,
+            "BusType": "SATA",
+            "MediaType": "SSD",
+            "IsRemovable": false
+        }"#;
+
+        let disk: PhysicalDisk = serde_json::from_str(json).unwrap();
+
+        assert_eq!(disk.size_bytes, 536_870_912);
+    }
+
+    #[test]
+    fn plan_for_disk_is_planned_for_an_eligible_disk() {
+        let disk = make_disk(false, false);
+
+        let plan = plan_for_disk(&disk);
+
+        assert_eq!(
+            plan,
+            DiskPlan::Planned {
+                total_bytes: disk.size_bytes,
+                pattern: PLANNED_PATTERN,
+                chunk_size: PLANNED_CHUNK_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_for_disk_skips_a_blocked_system_disk() {
+        let disk = make_disk(true, false);
+
+        assert!(matches!(plan_for_disk(&disk), DiskPlan::Skipped(_)));
+    }
+
+    #[test]
+    fn plan_for_disk_is_pending_for_a_capacity_untrusted_bus_type() {
+        // Eligible (not system/boot), but the bus type is not on the
+        // capacity-trusted list -- confirmed necessary on real hardware
+        // (A.1): a USB-SD bridge reported ~2045GB for a physically 32GB
+        // card. Must not be silently promoted to a trusted, byte-count
+        // -bearing Planned.
+        let mut disk = make_disk(false, false);
+        disk.bus_type = Some("USB".to_string());
+
+        let plan = plan_for_disk(&disk);
+
+        assert!(matches!(plan, DiskPlan::PendingCapacityConfirmation(_)));
+    }
+
+    #[test]
+    fn plan_for_disk_is_pending_for_an_absent_bus_type() {
+        // Fail closed: no bus type reported at all must not default to
+        // trusted just because it also isn't a known-bad one.
+        let mut disk = make_disk(false, false);
+        disk.bus_type = None;
+
+        let plan = plan_for_disk(&disk);
+
+        assert!(matches!(plan, DiskPlan::PendingCapacityConfirmation(_)));
+    }
+
+    #[test]
+    fn plan_for_disk_is_planned_even_when_media_type_is_unrecognized_for_a_trusted_bus() {
+        // This is the case the old MediaType-based gate got wrong: a
+        // perfectly trustworthy internal disk (bus type SATA/NVMe/etc.) can
+        // still have a blank MediaType (observed on this machine's own NVMe
+        // SSD). Capacity trust must key on bus type only, not media type.
+        let mut disk = make_disk(false, false);
+        disk.bus_type = Some("NVMe".to_string());
+        disk.media_type = None;
+
+        let plan = plan_for_disk(&disk);
+
+        assert_eq!(
+            plan,
+            DiskPlan::Planned {
+                total_bytes: disk.size_bytes,
+                pattern: PLANNED_PATTERN,
+                chunk_size: PLANNED_CHUNK_SIZE,
+            }
+        );
     }
 
     #[test]

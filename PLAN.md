@@ -126,15 +126,126 @@ Removable media has distinct failure modes worth testing specifically —
 hot-unplug mid-operation, drive-letter reassignment on reconnect, and whether
 Windows reports bus type correctly for USB-attached drives.
 
+### A.1.1 First real-hardware run — verified against a USB card reader
+
+Ran the built binary (elevated) against a USB 2.0 SD card reader with a
+32GB card. Inventory, disk/partition/BitLocker correlation, eligibility
+(`ELIGIBLE`, correctly not flagged as system/boot), and all 5 extended
+pre-flight checks (`SAFE`) all behaved correctly against removable media.
+
+One anomaly found and root-caused: `Get-Disk` reported this disk's size as
+~2045 GB against a physical 32GB card (confirmed via raw
+`Get-Disk | Select Number,FriendlyName,Size` — the inflated value comes
+back straight from `Get-Disk`, in bytes, before this program ever sees it).
+Traced the full path (`get_physical_disks`, `PhysicalDisk.size_gb`, the
+print statement) — the `/1GB` conversion and formatting are correct;
+nothing in this crate is at fault. This is a known failure mode of
+cheap/counterfeit USB-SD bridge chips misreporting their LBA count at the
+OS/WMI level — **not a defect in this crate**, and not fixed here.
+Sanity-checking/clamping reported disk sizes is out of scope for A.1; if
+wanted later, it belongs with M1-3's media/capability detection work,
+since both are about how much to trust `Get-Disk` for removable media.
+
+Still open from A.1: hot-unplug-mid-run and drive-letter-reassignment-on-
+reconnect have not yet been tested. Deferred deliberately, not dropped —
+does not block M1-3, but **must** be closed before M1-7 (first destructive
+code), since a drive vanishing mid-write is exactly what turns a safely
+cancelled operation into a corrupted, unverifiable one.
+
 ## A.2 Remaining milestones
 
-- **M1-3** Media/capability detection (HDD/SSD/NVMe/removable, bus type) wired
-  into the policy engine — includes adding `BusType`/`MediaType` to the
-  `Get-Disk` query
-- **M1-4** Planner / dry-run — prints the plan, executes nothing
-- **M1-5** Destructive confirmation — explicit serial re-entry, Clear vs. Purge
-  acknowledgment shown to the operator. **Gates every write path.**
-- **M1-6** Disk offline/online transition, reversible
+- ~~**M1-3** Media/capability detection~~ — **done.** `PhysicalDisk` now
+  carries `bus_type`/`media_type`/`is_removable` from `Get-Disk`, and a new
+  `Media Detection` pre-flight check (fail-closed `Unknown` unless both bus
+  type and media type are recognized) participates in the existing
+  `PreflightReport` combination. Verified end-to-end against real hardware
+  (internal NVMe SSD + USB card reader):
+  - `BusType` is reliable here — resolved correctly to `NVMe` and `USB`.
+  - `MediaType`/`IsRemovable` come back blank from `Get-Disk` itself on
+    this machine for **both** disks — confirmed via a raw
+    `Get-Disk | Select-Object ... | Format-List` with no code involved.
+    This is a real driver/OS limitation (some NVMe controllers and USB
+    bridge chips just don't report it), not a bug — `bus_type` should be
+    weighted as the more trustworthy signal in practice whenever M1-9/M1-11
+    later consume this data.
+  - One real bug found and fixed during this milestone: `is_removable` was
+    initially typed as plain `bool`, but `Get-Disk` can return `null` for
+    it (same as `BusType`/`MediaType`), which crashed JSON deserialization
+    for every disk. Fixed to `Option<bool>`; regression test added that
+    deserializes a literal JSON fragment with `"IsRemovable": null`.
+- ~~**M1-4** Planner / dry-run~~ — **done, then revised.** `plan_for_disk`
+  states `Planned`/`Skipped`/`PendingCapacityConfirmation` per disk from
+  `Eligibility` + a capacity-trust check, printed under a new
+  `=== Sanitization Plan (dry-run -- nothing executed) ===` section.
+  Nothing here calls `raw_write::overwrite` or decides Clear vs. Purge
+  (still M1-5/M1-9/M1-11). See A.3 for the architecture review that revised
+  its gating logic before this was considered done.
+- ~~**M1-5** Destructive confirmation~~ — **done.** Design was reviewed and
+  approved before any code was written (state/transition model,
+  confirmation UX, full failure matrix). Built in two reviewed phases:
+  - **Phase 1** (pure logic): `BoundOperation` + `confirm_and_bind` — (a)
+    requires the operator's typed input to exactly match the selected
+    disk's serial, (b) re-runs `verify_target_before_operation` against a
+    fresh inventory snapshot, (c) re-derives the plan via `plan_for_disk`
+    and requires it to be *structurally identical* to the plan shown at
+    confirmation time. (c) is the actual point of the milestone: identity
+    fields alone (serial/name/size) can stay unchanged while a disk's
+    capacity-trust classification changes, and only re-deriving the whole
+    plan catches that. Also fixed a related precision gap:
+    `verify_target_before_operation` compared only the rounded `size_gb`;
+    it now also compares exact `size_bytes`.
+  - **Phase 2** (CLI/stdin wrapper): opt-in `--target-disk N` flag (this
+    binary's first-ever CLI argument, parsed by a small pure
+    `parse_target_disk_arg`, no new dependency) prints the existing reports
+    unconditionally, then — only if a disk was named — selects, plans,
+    shows a destructive/irreversible confirmation prompt naming the exact
+    disk and plan, reads one line from stdin, re-fetches inventory, and
+    calls `confirm_and_bind`. Refuses *before* ever showing a prompt if the
+    disk isn't `Planned` or has no serial. Single attempt, fail-closed, no
+    retry loop — exit code `2` for every refusal path, rerun the tool to
+    retry. Default (no arguments) behavior is unchanged.
+  - `raw_write::overwrite` remains completely unwired — M1-5 only decides
+    whether an operation *may* be bound; nothing calls it. 14 new unit
+    tests total across both phases, all passing, no real I/O in any of
+    them (the stdin/prompt wrapper itself is untested, same posture as
+    every other I/O edge in this project — verified manually instead).
+- ~~**M1-6** Disk offline/online transition, reversible~~ — **done.**
+  `evaluate_transition_eligibility` gates on the existing boot/system-disk
+  check only (`evaluate_eligibility`), deliberately not on the capacity-trust
+  gate — taking a disk offline writes no data, so it's orthogonal to whether
+  its reported capacity is trusted. `set_disk_offline`/`set_disk_online` call
+  `Set-Disk -IsOffline`, following the same execute/decode/stderr-check
+  pattern as every other PowerShell caller in this file. New opt-in
+  `--offline-disk N`/`--online-disk N` flags (mutually exclusive with each
+  other and with `--target-disk`), gated by a plain `YES` confirmation rather
+  than M1-5's serial retype, since this operation is reversible and destroys
+  nothing. 4 new unit tests for `evaluate_transition_eligibility` (system
+  disk blocked both directions, already-offline blocked, already-online
+  blocked, valid transition allowed both directions).
+
+  Deliberately no pre-check for removable media before calling `Set-Disk`:
+  `is_removable`/`media_type` are already known to be blank on real hardware
+  here (see M1-3 above), so this defers to `Set-Disk`'s own authoritative
+  rejection rather than guessing from an unreliable signal.
+
+  **Real-hardware verification** (elevated, against this machine's actual
+  disks): `--offline-disk 0` (the boot NVMe SSD) is rejected at the
+  eligibility check before any prompt is shown. `--offline-disk 1` (the USB
+  card reader) passes eligibility, reaches the confirmation prompt, and on
+  `YES` fails with Windows' own error, surfaced verbatim: `Set-Disk : Not
+  Supported / Removable media cannot be set to offline.` Disk 1 was confirmed
+  still `Online`, unchanged, via a fresh `Get-Disk` query afterward — no
+  partial state change from the rejected attempt.
+
+  **Deferred, not assumed:** the actual offline → `Get-Disk` shows Offline →
+  online → remount/drive-letter-restoration round-trip has not been run
+  against real hardware. No eligible disk exists in this environment for it
+  — Disk 0 is boot-blocked by design, Disk 1 is rejected by Windows itself
+  (removable media cannot be taken offline at all, independent of the
+  capacity-trust gate). This needs a non-boot, fixed (non-removable) internal
+  disk before it can be verified; until then, the drive-letter/mount
+  restoration behavior of `Set-Disk -IsOffline $false` on a disk with
+  existing volumes is unconfirmed, not guaranteed.
 - **M1-7** HDD sanitization — **first destructive code.** Dedicated test
   hardware only, including at least one USB drive and one memory card
 - **M1-8** Verification + reporting — bytes written, failure offset, read-back
@@ -145,6 +256,56 @@ Windows reports bus type correctly for USB-attached drives.
   `unsafe_code = "forbid"` must be consciously relaxed, not deleted
 - **M1-12** Interruption / power-loss recovery — never assumes started =
   completed
+
+## A.3 Architecture review — demoting BitLocker, fixing the capacity-trust gate
+
+A brutally-critical review of the whole safety architecture (requested
+explicitly, to check whether every missing/unresolvable Windows fact was
+being turned into `UNKNOWN` without real safety justification) found two
+concrete miscategorizations, both fixed in the same pass:
+
+1. **BitLocker protection status used to hard-block `Eligibility`.** A
+   physical overwrite destroys ciphertext exactly as well as plaintext, so
+   encryption status is not a wrong-disk/system-destruction risk — it's
+   method-selection input for M1-10 (crypto-erase vs. physical Purge). It
+   was also responsible for the majority of `Eligibility`'s
+   `Unknown`-producing branches. **Fixed:** `evaluate_eligibility` now
+   checks only the boot/system-disk flag (`Eligible`/`Blocked`, no more
+   `Unknown` variant — it was never producible by anything else).
+   BitLocker's exact same checks (same messages, same order) now live in
+   `evaluate_bitlocker_protection`, a new informational
+   `PreflightCheck::BitLockerProtection` entry alongside Media Detection —
+   visible, never blocking. `select_target_disk`/`verify_target_before_operation`
+   both simplified accordingly (drop unused `partitions`/`bitlocker` params);
+   a BitLocker-protected non-system disk is now selectable/verifiable,
+   which is the intended effect.
+2. **M1-4's `plan_for_disk` gated `Planned` on `evaluate_media_detection`**
+   (both `bus_type` and `media_type` had to be "recognized"). This
+   happened to correctly withhold planning for the USB card reader (known
+   bogus ~2045GB-reported/32GB-real capacity, A.1) — but only because
+   `MediaType` was blank on that hardware. The internal NVMe SSD's
+   `MediaType` was *also* blank, with no capacity-trust problem at all, so
+   the old gate would have incorrectly withheld planning for any other
+   internal disk in the same state. **Fixed:** capacity trust now keys on
+   an allow-list of `bus_type` categories known to reliably report true
+   LBA count (`SATA`, `NVMe`, `SAS`, `ATA`, `SCSI`, `Fibre Channel`,
+   `RAID`, `iSCSI`) — fail-closed for anything else, including an absent
+   bus type. `DiskPlan::PendingMediaConfirmation` renamed to
+   `PendingCapacityConfirmation` (no byte count attached — a distrusted
+   number must never live inside a plan-shaped value; `main()` prints the
+   raw `Get-Disk` size separately, explicitly labeled as unresolved
+   inventory, not a plan).
+
+**Not changed in this pass** (flagged as lower-priority defense-in-depth,
+not touched): Hibernation and Crash Dump checks remain — both are
+near-fully redundant with the boot/system-disk block in most real
+configurations, but still cover rare, real configs (e.g.
+`DedicatedDumpFile` on another volume).
+
+**Still the single biggest gap:** the actual destructive-operation
+confirmation gate (M1-5) does not exist yet. `select_target_disk` and
+`verify_target_before_operation` are fully built, tested, and now
+simplified further by this cleanup — but still have zero callers.
 
 ---
 
