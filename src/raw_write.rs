@@ -1,22 +1,17 @@
-//! Chunked overwrite loop for M1-7 (HDD sanitization).
+//! Chunked overwrite loop for M1-7 (HDD/removable-media sanitization).
 //!
-//! SAFETY BOUNDARY: nothing in this module can touch a physical device. It is
-//! generic over `std::io::Write` and never opens a file, a handle, or a device
-//! path — the caller supplies the sink. No caller exists yet: `overwrite()` is
-//! wired to nothing, and it must stay that way until M1-5's destructive
-//! confirmation gate (explicit serial re-entry, Clear vs. Purge acknowledgment)
-//! is built. This file is the write *loop*, not a write *path*.
+//! Generic over `std::io::Write` and never opens a file, a handle, or a
+//! device path itself — the caller supplies the sink. The one caller is
+//! `main.rs`'s `execute_sanitization`, which opens `\\.\PhysicalDriveN` via
+//! safe `std::fs`/`OpenOptionsExt` and passes the resulting `File` in here.
+//! This file is still just the write *loop* — it has no opinion about what
+//! it's writing to.
 //!
 //! The loop is deliberately hand-rolled on `write()` rather than delegating to
 //! `write_all()`. `write_all` collapses partial progress into a bare error, and
 //! the byte offset a sanitization reached before failing is the single most
 //! important fact to report: it is the boundary between "provably overwritten"
 //! and "untouched". Losing it would make an interrupted wipe unauditable.
-
-// Module-wide: every item here is deliberately unwired until M1-5's confirmation
-// gate exists, so the outcome fields and accessor have no non-test reader yet.
-// Same posture as select_target_disk / verify_target_before_operation in main.rs.
-#![allow(dead_code)]
 
 use std::io::{ErrorKind, Write};
 
