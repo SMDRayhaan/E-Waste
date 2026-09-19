@@ -246,10 +246,33 @@ cancelled operation into a corrupted, unverifiable one.
   disk before it can be verified; until then, the drive-letter/mount
   restoration behavior of `Set-Disk -IsOffline $false` on a disk with
   existing volumes is unconfirmed, not guaranteed.
-- **M1-7** HDD sanitization — **first destructive code.** Dedicated test
-  hardware only, including at least one USB drive and one memory card
-- **M1-8** Verification + reporting — bytes written, failure offset, read-back
-  sampling; distinct `EXECUTION_SUCCESS` vs `VERIFICATION_SUCCESS`
+- ~~**M1-7** HDD sanitization~~ — **done.** `execute_sanitization` is wired
+  into `main()`'s `Ok(bound)` arm: acquires the volume lock, opens
+  `\\.\PhysicalDriveN`, runs `raw_write::overwrite`, flushes, releases the
+  lock. `SanitizationResult` distinguishes `Completed` /
+  `CompletedWithWarnings` (lock cleanup or flush issues) / `Cancelled` (e.g.
+  volume-lock helper died mid-write) / `Failed` / `LockNeverEstablished`.
+  Not yet run against dedicated test hardware — that verification (at least
+  one USB drive and one memory card) is still open.
+- ~~**M1-8** Verification + reporting~~ — **done.** `raw_write::verify_sample`
+  reads back `VERIFY_SAMPLE_COUNT` (8) evenly spaced `VERIFY_SAMPLE_SIZE`
+  (64 KiB) windows from the just-written range and confirms every byte
+  equals the pattern — sampling, not a full re-read (documented as a
+  `ponytail:` ceiling; upgrade path is a full re-read or a running hash
+  computed during the write, if sampling assurance is ever judged
+  insufficient). Read-back happens through the same locked/dismounted
+  device handle, before the volume lock is released, for the same reason
+  the flush does. `execute_sanitization` now carries a `VerificationStatus`
+  (`NotAttempted` / `Verified` / `Mismatch` / `ReadError`) alongside each
+  `SanitizationResult`, deliberately orthogonal to the execution outcome —
+  a clean `EXECUTION_SUCCESS` with a failed verification still exits
+  non-zero, since that's exactly the case a forensic tool must never
+  silently report as success. `main()` prints both lines explicitly
+  (`Execution: EXECUTION_SUCCESS ...` / `Verification: VERIFICATION_SUCCESS
+  ...`). 12 new unit tests in `raw_write.rs` (trivial zero-byte case, full
+  match, mismatch detection at a deterministic offset, read errors,
+  under-sized ranges, and `sample_offsets` spacing/collapse behavior).
+  Not yet run against dedicated test hardware, same as M1-7.
 - **M1-9** SSD/flash Clear (addressable sectors only, explicitly scoped)
 - **M1-10** Crypto-erase via BitLocker key destruction
 - **M1-11** NVMe device-level Purge (FFI) — one of the points where

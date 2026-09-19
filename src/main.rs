@@ -312,6 +312,13 @@ fn verify_target_before_operation<'a>(
 const PLANNED_PATTERN: u8 = 0x00;
 const PLANNED_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 
+// --- M1-8: post-write verification -------------------------------------------
+//
+// Sampling, not a full re-read -- see raw_write::verify_sample's own ponytail
+// note for the assurance ceiling this implies and the upgrade path.
+const VERIFY_SAMPLE_SIZE: usize = 64 * 1024; // 64 KiB per window
+const VERIFY_SAMPLE_COUNT: usize = 8;
+
 // Bus types whose reported capacity is trusted for planning purposes:
 // internal, directly-attached buses where Windows' own value reliably
 // reflects true device LBA count. Anything else -- including USB/SD/MMC
@@ -1446,18 +1453,6 @@ fn parse_disk_number_arg(args: &[String], flag: &str) -> Result<Option<u32>, Str
     Ok(None)
 }
 
-fn parse_target_disk_arg(args: &[String]) -> Result<Option<u32>, String> {
-    parse_disk_number_arg(args, "--target-disk")
-}
-
-fn parse_offline_disk_arg(args: &[String]) -> Result<Option<u32>, String> {
-    parse_disk_number_arg(args, "--offline-disk")
-}
-
-fn parse_online_disk_arg(args: &[String]) -> Result<Option<u32>, String> {
-    parse_disk_number_arg(args, "--online-disk")
-}
-
 fn require_disk_inventory(
     disks_result: &Result<Vec<PhysicalDisk>, Box<dyn std::error::Error>>,
     disk_number: u32,
@@ -1619,22 +1614,51 @@ fn open_physical_drive_for_write(disk_number: u32) -> Result<std::fs::File, Stri
 // fully trustworthy" into the same message -- a clean byte count with a
 // failed flush, a lost lock, or unconfirmed cleanup are all real, distinct
 // outcomes that must stay visible.
+// M1-8: an execution outcome (did the write loop, flush and lock cleanup all
+// go cleanly?) and a verification outcome (did an independent read-back
+// confirm the pattern actually landed?) are orthogonal questions, deliberately
+// not collapsed into one status. A clean execution with a failed verification
+// is exactly the case a forensic tool must never silently report as success.
+#[derive(Debug)]
+enum VerificationStatus {
+    // No write reached the device (LockNeverEstablished, or a Failed/
+    // Cancelled outcome with bytes_written == 0) -- there is nothing to
+    // sample, and that is distinct from having sampled and passed.
+    NotAttempted,
+    Verified {
+        samples_checked: usize,
+    },
+    Mismatch {
+        offset: u64,
+        expected: u8,
+        found: u8,
+    },
+    ReadError {
+        offset: u64,
+        error: String,
+    },
+}
+
 #[derive(Debug)]
 enum SanitizationResult {
     Completed {
         bytes_written: u64,
+        verification: VerificationStatus,
     },
     CompletedWithWarnings {
         bytes_written: u64,
         warnings: Vec<String>,
+        verification: VerificationStatus,
     },
     Cancelled {
         bytes_written: u64,
         reason: String,
+        verification: VerificationStatus,
     },
     Failed {
         bytes_written: u64,
         error: String,
+        verification: VerificationStatus,
     },
     LockNeverEstablished(String),
 }
@@ -1703,9 +1727,47 @@ fn execute_sanitization(bound: &BoundOperation, partitions: &[Partition]) -> San
     // is gone, undermining the exact guarantee the helper exists to provide.
     let flush_result = device.sync_all().map_err(|e| e.to_string());
 
-    // Released unconditionally, even if sync_all() failed above -- an
-    // orphaned locking helper must never be left behind because of an
-    // unrelated flush error.
+    // Read-back verification, like the flush above, must happen before the
+    // lock is released: reading through the same locked/dismounted physical
+    // handle guarantees the bytes came from the device, not from a
+    // filesystem or cache that could remount the instant the lock is gone.
+    // Only meaningful once flush has actually happened -- a write the OS
+    // hasn't flushed yet has nothing durable to sample.
+    let bytes_written = outcome.bytes_written();
+    let verification = if flush_result.is_err() || bytes_written == 0 {
+        VerificationStatus::NotAttempted
+    } else {
+        match raw_write::verify_sample(
+            &mut device,
+            bytes_written,
+            pattern,
+            VERIFY_SAMPLE_SIZE,
+            VERIFY_SAMPLE_COUNT,
+        ) {
+            raw_write::VerifyOutcome::Verified { samples_checked } => {
+                VerificationStatus::Verified { samples_checked }
+            }
+            raw_write::VerifyOutcome::Mismatch {
+                offset,
+                expected,
+                found,
+            } => VerificationStatus::Mismatch {
+                offset,
+                expected,
+                found,
+            },
+            raw_write::VerifyOutcome::ReadError { offset, source } => {
+                VerificationStatus::ReadError {
+                    offset,
+                    error: source.to_string(),
+                }
+            }
+        }
+    };
+
+    // Released unconditionally, even if sync_all() or verification failed
+    // above -- an orphaned locking helper must never be left behind because
+    // of an unrelated flush/verification error.
     let lifecycle = volume_lock::release(helper);
 
     let mut warnings = Vec::new();
@@ -1716,15 +1778,18 @@ fn execute_sanitization(bound: &BoundOperation, partitions: &[Partition]) -> San
         warnings.push(format!("flush failed: {e}"));
     }
 
-    let bytes_written = outcome.bytes_written();
     match outcome {
         raw_write::WriteOutcome::Completed { .. } => {
             if warnings.is_empty() {
-                SanitizationResult::Completed { bytes_written }
+                SanitizationResult::Completed {
+                    bytes_written,
+                    verification,
+                }
             } else {
                 SanitizationResult::CompletedWithWarnings {
                     bytes_written,
                     warnings,
+                    verification,
                 }
             }
         }
@@ -1735,6 +1800,7 @@ fn execute_sanitization(bound: &BoundOperation, partitions: &[Partition]) -> San
             } else {
                 "cancelled".to_string()
             },
+            verification,
         },
         raw_write::WriteOutcome::Failed {
             bytes_written,
@@ -1742,7 +1808,46 @@ fn execute_sanitization(bound: &BoundOperation, partitions: &[Partition]) -> San
         } => SanitizationResult::Failed {
             bytes_written,
             error: source.to_string(),
+            verification,
         },
+    }
+}
+
+// Prints the verification line for a SanitizationResult and reports whether
+// it should force a non-zero exit even when execution otherwise looked clean
+// -- a Mismatch or ReadError here means an EXECUTION_SUCCESS cannot be
+// trusted, which is exactly the case this milestone exists to catch.
+fn report_verification(verification: &VerificationStatus) -> bool {
+    match verification {
+        VerificationStatus::NotAttempted => {
+            println!("Verification: NOT ATTEMPTED (no bytes were durably written).");
+            false
+        }
+        VerificationStatus::Verified { samples_checked } => {
+            println!(
+                "Verification: VERIFICATION_SUCCESS ({} sample window(s) matched the pattern).",
+                samples_checked
+            );
+            false
+        }
+        VerificationStatus::Mismatch {
+            offset,
+            expected,
+            found,
+        } => {
+            println!(
+                "Verification: VERIFICATION_FAILED -- byte at offset {} is {:#04x}, expected {:#04x}.",
+                offset, found, expected
+            );
+            true
+        }
+        VerificationStatus::ReadError { offset, error } => {
+            println!(
+                "Verification: VERIFICATION_FAILED -- read-back near offset {} failed: {}.",
+                offset, error
+            );
+            true
+        }
     }
 }
 
@@ -1750,21 +1855,21 @@ fn main() {
     // Parsed before elevation/enumeration: a malformed disk-number value is a
     // pure input error, unrelated to disk access, and should fail fast.
     let args: Vec<String> = std::env::args().collect();
-    let target_disk = match parse_target_disk_arg(&args) {
+    let target_disk = match parse_disk_number_arg(&args, "--target-disk") {
         Ok(target_disk) => target_disk,
         Err(e) => {
             eprintln!("{}", e);
             std::process::exit(2);
         }
     };
-    let offline_disk = match parse_offline_disk_arg(&args) {
+    let offline_disk = match parse_disk_number_arg(&args, "--offline-disk") {
         Ok(offline_disk) => offline_disk,
         Err(e) => {
             eprintln!("{}", e);
             std::process::exit(2);
         }
     };
-    let online_disk = match parse_online_disk_arg(&args) {
+    let online_disk = match parse_disk_number_arg(&args, "--online-disk") {
         Ok(online_disk) => online_disk,
         Err(e) => {
             eprintln!("{}", e);
@@ -2247,38 +2352,56 @@ be correlated to a physical disk: {}",
             println!();
             println!("=== Executing ===");
             match execute_sanitization(&bound, &fresh_partitions) {
-                SanitizationResult::Completed { bytes_written } => {
-                    println!("Completed: {} bytes written.", bytes_written);
+                SanitizationResult::Completed {
+                    bytes_written,
+                    verification,
+                } => {
+                    println!(
+                        "Execution: EXECUTION_SUCCESS ({} bytes written).",
+                        bytes_written
+                    );
+                    if report_verification(&verification) {
+                        std::process::exit(2);
+                    }
                 }
                 SanitizationResult::CompletedWithWarnings {
                     bytes_written,
                     warnings,
+                    verification,
                 } => {
                     println!(
-                        "Completed with warnings: {} bytes written, but this run is NOT \
-fully confirmed clean:",
+                        "Execution: EXECUTION_SUCCESS with warnings ({} bytes written), but \
+this run is NOT fully confirmed clean:",
                         bytes_written
                     );
                     for warning in &warnings {
                         println!("  - {}", warning);
                     }
+                    report_verification(&verification);
                     std::process::exit(2);
                 }
                 SanitizationResult::Cancelled {
                     bytes_written,
                     reason,
+                    verification,
                 } => {
                     println!(
-                        "Cancelled after {} bytes written: {}",
+                        "Execution: CANCELLED after {} bytes written: {}",
                         bytes_written, reason
                     );
+                    report_verification(&verification);
                     std::process::exit(2);
                 }
                 SanitizationResult::Failed {
                     bytes_written,
                     error,
+                    verification,
                 } => {
-                    eprintln!("Failed after {} bytes written: {}", bytes_written, error);
+                    eprintln!(
+                        "Execution: EXECUTION_FAILED after {} bytes written: {}",
+                        bytes_written, error
+                    );
+                    report_verification(&verification);
                     std::process::exit(2);
                 }
                 SanitizationResult::LockNeverEstablished(reason) => {
@@ -3283,7 +3406,7 @@ mod tests {
     fn parse_target_disk_arg_returns_none_when_absent() {
         let args = vec!["E-Waste.exe".to_string()];
 
-        assert_eq!(parse_target_disk_arg(&args), Ok(None));
+        assert_eq!(parse_disk_number_arg(&args, "--target-disk"), Ok(None));
     }
 
     #[test]
@@ -3294,14 +3417,14 @@ mod tests {
             "1".to_string(),
         ];
 
-        assert_eq!(parse_target_disk_arg(&args), Ok(Some(1)));
+        assert_eq!(parse_disk_number_arg(&args, "--target-disk"), Ok(Some(1)));
     }
 
     #[test]
     fn parse_target_disk_arg_errors_when_value_is_missing() {
         let args = vec!["E-Waste.exe".to_string(), "--target-disk".to_string()];
 
-        assert!(parse_target_disk_arg(&args).is_err());
+        assert!(parse_disk_number_arg(&args, "--target-disk").is_err());
     }
 
     #[test]
@@ -3312,7 +3435,7 @@ mod tests {
             "abc".to_string(),
         ];
 
-        assert!(parse_target_disk_arg(&args).is_err());
+        assert!(parse_disk_number_arg(&args, "--target-disk").is_err());
     }
 
     // --- M-2: extended pre-flight -------------------------------------------

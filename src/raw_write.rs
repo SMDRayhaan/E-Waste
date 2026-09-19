@@ -1,19 +1,21 @@
-//! Chunked overwrite loop for M1-7 (HDD/removable-media sanitization).
+//! Chunked overwrite loop for M1-7 (HDD/removable-media sanitization), plus
+//! M1-8's post-write read-back sampling.
 //!
-//! Generic over `std::io::Write` and never opens a file, a handle, or a
-//! device path itself — the caller supplies the sink. The one caller is
-//! `main.rs`'s `execute_sanitization`, which opens `\\.\PhysicalDriveN` via
-//! safe `std::fs`/`OpenOptionsExt` and passes the resulting `File` in here.
-//! This file is still just the write *loop* — it has no opinion about what
-//! it's writing to.
+//! Generic over `std::io::Write`/`Read + Seek` and never opens a file, a
+//! handle, or a device path itself — the caller supplies the sink/source. The
+//! one caller is `main.rs`'s `execute_sanitization`, which opens
+//! `\\.\PhysicalDriveN` via safe `std::fs`/`OpenOptionsExt` and passes the
+//! resulting `File` in here. This file has no opinion about what it's
+//! reading or writing to.
 //!
-//! The loop is deliberately hand-rolled on `write()` rather than delegating to
-//! `write_all()`. `write_all` collapses partial progress into a bare error, and
-//! the byte offset a sanitization reached before failing is the single most
-//! important fact to report: it is the boundary between "provably overwritten"
-//! and "untouched". Losing it would make an interrupted wipe unauditable.
+//! The write loop is deliberately hand-rolled on `write()` rather than
+//! delegating to `write_all()`. `write_all` collapses partial progress into a
+//! bare error, and the byte offset a sanitization reached before failing is
+//! the single most important fact to report: it is the boundary between
+//! "provably overwritten" and "untouched". Losing it would make an
+//! interrupted wipe unauditable.
 
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 
 /// Bytes completed so far against the total requested, reported at every chunk
 /// boundary.
@@ -122,6 +124,88 @@ pub fn overwrite<W: Write>(
     }
 
     WriteOutcome::Completed { bytes_written }
+}
+
+/// How a post-write read-back sample compared against the pattern that was
+/// written. `ReadError` carries the offset the failing window started at, not
+/// the exact byte, since a read failure (unlike a mismatch) gives no byte to
+/// point to.
+#[derive(Debug)]
+pub enum VerifyOutcome {
+    Verified {
+        samples_checked: usize,
+    },
+    Mismatch {
+        offset: u64,
+        expected: u8,
+        found: u8,
+    },
+    ReadError {
+        offset: u64,
+        source: std::io::Error,
+    },
+}
+
+/// Reads back `sample_count` evenly spaced windows of `sample_size` bytes
+/// from `[0, bytes_written)` of `source` and confirms every byte in each
+/// equals `pattern`. `bytes_written` == 0 verifies trivially (nothing was
+/// written, so there is nothing to sample).
+///
+/// # ponytail: sampling, not a full re-read -- proves the pattern at
+/// `sample_count` points, not every byte. A full re-read would double the
+/// time of every sanitization run. Upgrade to a full re-read (or a running
+/// hash computed during the write) if sampling assurance is ever judged
+/// insufficient for a compliance requirement.
+pub fn verify_sample<R: Read + Seek>(
+    source: &mut R,
+    bytes_written: u64,
+    pattern: u8,
+    sample_size: usize,
+    sample_count: usize,
+) -> VerifyOutcome {
+    if bytes_written == 0 || sample_count == 0 {
+        return VerifyOutcome::Verified { samples_checked: 0 };
+    }
+
+    let window = (sample_size as u64).min(bytes_written).max(1);
+    let mut buffer = vec![0u8; window as usize];
+    let mut checked = 0usize;
+
+    for offset in sample_offsets(bytes_written, window, sample_count) {
+        if let Err(e) = source.seek(SeekFrom::Start(offset)) {
+            return VerifyOutcome::ReadError { offset, source: e };
+        }
+        if let Err(e) = source.read_exact(&mut buffer) {
+            return VerifyOutcome::ReadError { offset, source: e };
+        }
+        if let Some(pos) = buffer.iter().position(|&b| b != pattern) {
+            return VerifyOutcome::Mismatch {
+                offset: offset + pos as u64,
+                expected: pattern,
+                found: buffer[pos],
+            };
+        }
+        checked += 1;
+    }
+
+    VerifyOutcome::Verified {
+        samples_checked: checked,
+    }
+}
+
+/// Evenly spaced start offsets for `count` windows of `window` bytes within
+/// `[0, total)`, deduplicated (a small `total` can make several requested
+/// offsets collapse onto the same window).
+fn sample_offsets(total: u64, window: u64, count: usize) -> Vec<u64> {
+    let last_start = total.saturating_sub(window);
+    if count <= 1 || last_start == 0 {
+        return vec![0];
+    }
+    let mut offsets: Vec<u64> = (0..count)
+        .map(|i| last_start * i as u64 / (count as u64 - 1))
+        .collect();
+    offsets.dedup();
+    offsets
 }
 
 #[cfg(test)]
@@ -440,5 +524,94 @@ mod tests {
 
         assert_eq!(contents.len(), 3000);
         assert!(contents.iter().all(|&b| b == 0xC3));
+    }
+
+    fn cursor_of(pattern: u8, len: usize) -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(vec![pattern; len])
+    }
+
+    #[test]
+    fn verify_zero_bytes_written_is_trivially_verified() {
+        let mut source = cursor_of(0x00, 0);
+        let outcome = verify_sample(&mut source, 0, 0xAA, 64, 8);
+        assert!(matches!(
+            outcome,
+            VerifyOutcome::Verified { samples_checked: 0 }
+        ));
+    }
+
+    #[test]
+    fn verify_matching_pattern_across_whole_range_succeeds() {
+        let mut source = cursor_of(0x5A, 10_000);
+        let outcome = verify_sample(&mut source, 10_000, 0x5A, 256, 8);
+        assert!(matches!(
+            outcome,
+            VerifyOutcome::Verified { samples_checked: 8 }
+        ));
+    }
+
+    #[test]
+    fn verify_detects_a_mismatch_and_reports_its_offset() {
+        // The last byte is always inside the last sample window (sample_offsets
+        // always places one window's end at the end of the range), so putting
+        // the mismatch there makes detection deterministic regardless of how
+        // the middle windows are spaced.
+        let mut data = vec![0xAA; 10_000];
+        data[9999] = 0xFF;
+        let mut source = std::io::Cursor::new(data);
+
+        let outcome = verify_sample(&mut source, 10_000, 0xAA, 256, 8);
+        match outcome {
+            VerifyOutcome::Mismatch {
+                offset,
+                expected,
+                found,
+            } => {
+                assert_eq!(offset, 9999);
+                assert_eq!(expected, 0xAA);
+                assert_eq!(found, 0xFF);
+            }
+            other => panic!("expected Mismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn verify_sample_smaller_than_window_still_checks_available_bytes() {
+        let mut source = cursor_of(0x11, 10);
+        let outcome = verify_sample(&mut source, 10, 0x11, 256, 8);
+        assert!(matches!(
+            outcome,
+            VerifyOutcome::Verified { samples_checked: 1 }
+        ));
+    }
+
+    #[test]
+    fn verify_read_error_is_reported_not_panicked() {
+        struct FailingSeek;
+        impl Read for FailingSeek {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(ErrorKind::UnexpectedEof))
+            }
+        }
+        impl Seek for FailingSeek {
+            fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+                Ok(0)
+            }
+        }
+
+        let outcome = verify_sample(&mut FailingSeek, 1000, 0xAA, 64, 4);
+        assert!(matches!(outcome, VerifyOutcome::ReadError { .. }));
+    }
+
+    #[test]
+    fn sample_offsets_are_evenly_spread_and_deduplicated() {
+        let offsets = sample_offsets(1_000_000, 100, 5);
+        assert_eq!(offsets.len(), 5);
+        assert_eq!(offsets[0], 0);
+        assert_eq!(*offsets.last().unwrap(), 1_000_000 - 100);
+        assert!(offsets.windows(2).all(|w| w[0] < w[1]));
+
+        // total == window: only one window fits, regardless of count.
+        assert_eq!(sample_offsets(100, 100, 8), vec![0]);
     }
 }
